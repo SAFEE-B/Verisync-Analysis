@@ -241,17 +241,20 @@ def _precompute_prompt_embeddings():
         
         with _cache_lock:
             for checkpoint in script_checkpoints:
-                prompt_text = checkpoint.get("prompt_text", "")
-                if prompt_text:
-                    clean_prompt_preserve = clean_text_for_matching(prompt_text, preserve_structure=True)
-                    clean_prompt_remove = clean_text_for_matching(prompt_text, preserve_structure=False)
-                    
-                    for prompt_version, version_key in [(clean_prompt_preserve, "preserve"), (clean_prompt_remove, "remove")]:
-                        if prompt_version.strip():
-                            cache_key = f"{checkpoint.get('checkpoint_id', 'unknown')}_{version_key}"
-                            if cache_key not in _prompt_embedding_cache:
-                                embedding = sbert_model.encode(prompt_version, convert_to_tensor=True)
-                                _prompt_embedding_cache[cache_key] = embedding
+                prompt_sentences = checkpoint.get("prompt_sentences", [])
+                checkpoint_id = checkpoint.get("checkpoint_id", "unknown")
+                for sent_idx, sentence in enumerate(prompt_sentences):
+                    if sentence:
+                        clean_prompt_preserve = clean_text_for_matching(sentence, preserve_structure=True)
+                        clean_prompt_remove = clean_text_for_matching(sentence, preserve_structure=False)
+                        
+                        for prompt_version, version_key in [(clean_prompt_preserve, "preserve"), (clean_prompt_remove, "remove")]:
+                            if prompt_version.strip():
+                                sentence_cache_id = f"{checkpoint_id}_{sent_idx}"
+                                cache_key = f"{sentence_cache_id}_{version_key}"
+                                if cache_key not in _prompt_embedding_cache:
+                                    embedding = sbert_model.encode(prompt_version, convert_to_tensor=True)
+                                    _prompt_embedding_cache[cache_key] = embedding
                                 
         print(f"[CACHE] Cached {len(_prompt_embedding_cache)} default prompt embeddings")
         
@@ -409,10 +412,10 @@ def process_whisper_segments(segments):
 DEFAULT_CALL_SCRIPT = """
 <semantic> Hello, thank you for calling Customer Service </semantic>
 <semantic> My name is [Agent Name], how can I assist you today? </semantic>
-<topic> I understand how frustrating that must be. Let me check available options for you </topic>
+<semantic> I understand how frustrating that must be. Let me check available options for you </semantic>
 <semantic> Can you provide your flight details? </semantic>
 <semantic> I see your flight was canceled due to [Reason] </semantic>
-<semantic> The next available flights are at [Times] </semantic>
+<semantic> The next available flights are at [Time] </semantic>
 <semantic> Would you like to proceed with one of these? </semantic>
 <semantic> Since this was due to [reason], our policy does not include compensation. However, I can offer [something]. </semantic>
 <semantic> I've rebooked your flight. </semantic>
@@ -450,12 +453,18 @@ def parse_script_from_text(script_text):
         
         if not prompt_text_clean:
             continue
+
+        try:
+            sentences = nltk.sent_tokenize(prompt_text_clean)
+        except Exception as e:
+            print(f"[SCRIPT PARSER] NLTK sentence tokenization failed: {e}. Treating as single sentence.")
+            sentences = [prompt_text_clean]
         
         # Assign weights based on adherence type and position
         # Higher weights for stricter types and important positions
         base_weights = {"STRICT": 25, "SEMANTIC": 20, "TOPIC": 15}
-        position_bonus = max(5, 25 - (i * 2))  # First checkpoints get higher weights
-        weight = base_weights.get(adherence_type_upper, 15) + min(position_bonus, 10)
+        
+        weight = base_weights.get(adherence_type_upper, 15)
         
         # Determine if mandatory - STRICT types are always mandatory
         # First and last checkpoints are also typically mandatory regardless of type
@@ -468,6 +477,7 @@ def parse_script_from_text(script_text):
         checkpoint = {
             "checkpoint_id": f"checkpoint_{i+1}_{adherence_type.lower()}",
             "prompt_text": prompt_text_clean,
+            "prompt_sentences": sentences,
             "adherence_type": adherence_type_upper,
             "is_mandatory": is_mandatory,
             "weight": weight
@@ -547,8 +557,9 @@ def clean_text_for_matching(text, preserve_structure=False):
 
 def check_script_adherence_adaptive_windows(agent_text, agent_segments, script_checkpoints=None, script_text=None):
     """
-    ADAPTIVE WINDOW APPROACH - Tests window sizes 1, 2, and 3 for each checkpoint
-    and automatically selects the best performing window size for optimal results.
+    ADAPTIVE WINDOW APPROACH - CONCATENATED
+    Tests window sizes 1, 2, and 3, concatenating segment text within the window
+    for a more robust comparison. Automatically selects the best performing window size.
     
     Args:
         agent_text: The agent's spoken text
@@ -565,137 +576,148 @@ def check_script_adherence_adaptive_windows(agent_text, agent_segments, script_c
     # Extract segment texts for processing
     segment_texts = []
     for segment in agent_segments:
-        if isinstance(segment, dict):
-            text = segment.get('text', '')
-        else:
-            text = str(segment)
+        text = segment.get('text', '') if isinstance(segment, dict) else str(segment)
         if text.strip():
             segment_texts.append(text.strip())
-
-    # Pre-compute segment embeddings
-    agent_embeddings = None
-    if SBERT_AVAILABLE and sbert_model:
-        try:
-            agent_embeddings = encode_sentences_with_memory_optimization(segment_texts, batch_size=32)
-        except Exception as e:
-            print(f"[ADAPTIVE] [ERROR] Failed to compute embeddings: {e}")
 
     checkpoint_results = []
     
     for i, checkpoint in enumerate(script_checkpoints):
         checkpoint_id = checkpoint.get("checkpoint_id", f"unknown_{i}")
-        prompt_text = checkpoint.get("prompt_text", "")
+        prompt_sentences = checkpoint.get("prompt_sentences", [])
+        if not prompt_sentences:
+            prompt_text = checkpoint.get("prompt_text", "")
+            if prompt_text:
+                prompt_sentences = [prompt_text]
+            else:
+                continue
+
         adherence_type = checkpoint.get("adherence_type", "SEMANTIC")
         weight = checkpoint.get("weight", 1)
-        is_mandatory = checkpoint.get("is_mandatory", False)
-        
-        clean_prompt_preserve = clean_text_for_matching(prompt_text, preserve_structure=True)
-        clean_prompt_remove = clean_text_for_matching(prompt_text, preserve_structure=False)
-        
-        # Pre-compute prompt embeddings
-        prompt_embedding_preserve, prompt_embedding_remove = None, None
-        if SBERT_AVAILABLE and sbert_model:
-            try:
-                prompt_embedding_preserve = get_cached_prompt_embedding(checkpoint_id, prompt_text, True)
-                prompt_embedding_remove = get_cached_prompt_embedding(checkpoint_id, prompt_text, False)
-            except Exception as e:
-                print(f"[ADAPTIVE] [ERROR] Failed to get cached embeddings: {e}")
+        is_mandatory = checkpoint.get("is_mandatory", True)
+        threshold_map = {'STRICT': 85, 'SEMANTIC': 60, 'TOPIC': 40}
+        threshold = threshold_map.get(adherence_type, 60)
 
-        best_overall_score = 0
-        best_window_size = 1
-        best_match_details = "No match found"
-        best_segment_location = None
-        
-        # Test each window size (1, 2, 3)
-        for window_size in [1, 2, 3]:
-            best_score_for_this_window_size = 0
-            best_match_info = None
+        print(f"\n[ADHERENCE] Analyzing Checkpoint {i+1}: {checkpoint_id} ({adherence_type})")
+
+        sentence_level_results = []
+        all_sentence_scores = []
+
+        for sent_idx, script_sentence in enumerate(prompt_sentences):
+            clean_prompt_preserve = clean_text_for_matching(script_sentence, preserve_structure=True)
+            clean_prompt_remove = clean_text_for_matching(script_sentence, preserve_structure=False)
             
-            # Create all possible windows of this size
-            for start_idx in range(len(segment_texts)):
-                end_idx = min(start_idx + window_size - 1, len(segment_texts) - 1)
-                
-                # Test each segment within the window
-                for seg_idx in range(start_idx, end_idx + 1):
-                    current_segment = segment_texts[seg_idx]
-                    score_for_segment = 0
+            prompt_embedding_preserve, prompt_embedding_remove = None, None
+            if SBERT_AVAILABLE and sbert_model:
+                try:
+                    sentence_cache_id = f"{checkpoint_id}_{sent_idx}"
+                    prompt_embedding_preserve = get_cached_prompt_embedding(sentence_cache_id, script_sentence, True)
+                    prompt_embedding_remove = get_cached_prompt_embedding(sentence_cache_id, script_sentence, False)
+                except Exception as e:
+                    print(f"[CONCAT] [ERROR] Failed to get cached prompt embeddings: {e}")
+
+            best_score_for_sentence = 0
+            best_match_info = None
+
+            # Test each window size (1, 2, 3)
+            for window_size in range(1, 4):
+                # Create all possible windows of the current size
+                for start_idx in range(len(segment_texts) - window_size + 1):
+                    end_idx = start_idx + window_size
+                    window_segments = segment_texts[start_idx:end_idx]
+                    window_text = " ".join(window_segments)
+                    
+                    score_for_window = 0
                     method_used = ""
 
                     if adherence_type == "STRICT":
-                        if clean_prompt_preserve in current_segment:
-                            score_for_segment = 100
-                            method_used = "exact_preserve"
-                        elif clean_prompt_remove in current_segment:
-                            score_for_segment = 100
-                            method_used = "exact_remove"
-                        else:
-                            score_preserve = fuzz.ratio(clean_prompt_preserve, current_segment)
-                            score_remove = fuzz.ratio(clean_prompt_remove, current_segment)
-                            score_for_segment = max(score_preserve, score_remove)
+                        # Check for exact match first
+                        if clean_prompt_preserve in window_text or clean_prompt_remove in window_text:
+                            score_for_window = 100
+                            method_used = "exact"
+                        else: # Fallback to fuzzy matching
+                            score_preserve = fuzz.ratio(clean_prompt_preserve, window_text)
+                            score_remove = fuzz.ratio(clean_prompt_remove, window_text)
+                            score_for_window = max(score_preserve, score_remove)
                             method_used = "fuzzy"
                     
-                    elif adherence_type == "SEMANTIC" and SBERT_AVAILABLE and agent_embeddings is not None:
-                        sim_preserve, sim_remove = 0, 0
-                        if prompt_embedding_preserve is not None:
-                            try:
-                                sim_preserve = util.cos_sim(prompt_embedding_preserve, agent_embeddings[seg_idx]).item()
-                            except:
-                                pass
-                        if prompt_embedding_remove is not None:
-                            try:
-                                sim_remove = util.cos_sim(prompt_embedding_remove, agent_embeddings[seg_idx]).item()
-                            except:
-                                pass
-                        
-                        score_for_segment = round(max(sim_preserve, sim_remove) * 100, 2)
-                        method_used = "sbert"
-                    
+                    elif adherence_type == "SEMANTIC" and SBERT_AVAILABLE and sbert_model:
+                        try:
+                            # Generate embedding for the concatenated window text on the fly
+                            window_embedding = sbert_model.encode(window_text, convert_to_tensor=True)
+                            
+                            sim_preserve, sim_remove = 0, 0
+                            if prompt_embedding_preserve is not None:
+                                sim_preserve = util.cos_sim(prompt_embedding_preserve, window_embedding).item()
+                            if prompt_embedding_remove is not None:
+                                sim_remove = util.cos_sim(prompt_embedding_remove, window_embedding).item()
+                            
+                            score_for_window = round(max(sim_preserve, sim_remove) * 100, 2)
+                            method_used = "sbert"
+                        except Exception as e:
+                            print(f"[CONCAT] [ERROR] Failed to compute semantic similarity for window: {e}")
+                            score_for_window = 0 # Assign 0 if embedding fails
+
                     elif adherence_type == "TOPIC":
-                        score_preserve = fuzz.ratio(clean_prompt_preserve, current_segment)
-                        score_remove = fuzz.ratio(clean_prompt_remove, current_segment)
-                        score_for_segment = max(score_preserve, score_remove)
+                        score_preserve = fuzz.ratio(clean_prompt_preserve, window_text)
+                        score_remove = fuzz.ratio(clean_prompt_remove, window_text)
+                        score_for_window = max(score_preserve, score_remove)
                         method_used = "fuzzy"
 
-                    # Track the best score for this window size
-                    if score_for_segment > best_score_for_this_window_size:
-                        best_score_for_this_window_size = score_for_segment
+                    # Track the best score found so far for this sentence
+                    if score_for_window > best_score_for_sentence:
+                        best_score_for_sentence = score_for_window
                         best_match_info = {
-                            "segment_idx": seg_idx + 1,
-                            "window_start": start_idx + 1,
-                            "window_end": end_idx + 1,
+                            "window_size": window_size,
+                            "window_start_idx": start_idx,
+                            "window_end_idx": end_idx - 1,
                             "method": method_used,
-                            "segment_text": current_segment[:50] + "..." if len(current_segment) > 50 else current_segment
+                            "matched_text": window_text
                         }
-                
-                if best_score_for_this_window_size >= 100:
+                    
+                    # Optimization: if a perfect score is found, no need to check other windows
+                    if best_score_for_sentence >= 100:
+                        break
+                if best_score_for_sentence >= 100:
                     break
-            
-            # Check if this window size gave us the best score so far
-            if best_score_for_this_window_size > best_overall_score:
-                best_overall_score = best_score_for_this_window_size
-                best_window_size = window_size
-                best_segment_location = best_match_info
-                if best_match_info:
-                    best_match_details = f"Best match {best_overall_score:.2f}% found using window size {window_size} at segment {best_match_info['segment_idx']}"
-                else:
-                    best_match_details = f"Best match {best_overall_score:.2f}% found using window size {window_size}"
 
-        # Determine final pass/fail status
-        threshold = {"STRICT": 85, "SEMANTIC": 60, "TOPIC": 40}.get(adherence_type, 60)
-        status = "PASS" if best_overall_score >= threshold else "FAIL"
+            sentence_status = "PASS" if best_score_for_sentence >= threshold else "FAIL"
+            
+            # NEW LOGIC: If sentence passes threshold, use 100 for averaging; otherwise use actual score
+            adjusted_score_for_averaging = 100 if sentence_status == "PASS" else best_score_for_sentence
+            
+            agent_match_text = best_match_info['matched_text'] if best_match_info else "No match found"
+
+            print(f"  - Script: '{script_sentence}'")
+            print(f"    Agent Match (Window): '{agent_match_text}' -> Score: {best_score_for_sentence:.2f}% ({sentence_status})")
+            print(f"    Adjusted Score for Averaging: {adjusted_score_for_averaging:.2f}%")
+
+            sentence_level_results.append({
+                "script_sentence": script_sentence,
+                "agent_match_text": agent_match_text,
+                "score": best_score_for_sentence,
+                "adjusted_score": adjusted_score_for_averaging,
+                "status": sentence_status,
+                "match_details": best_match_info
+            })
+            all_sentence_scores.append(adjusted_score_for_averaging)
+
+        final_checkpoint_score = (sum(all_sentence_scores) / len(all_sentence_scores)) if all_sentence_scores else 0
+        # NEW LOGIC: Checkpoint passes if average adjusted score > 60
+        final_checkpoint_status = "PASS" if final_checkpoint_score > 60 else "FAIL"
+        
+        print(f"[ADHERENCE] Checkpoint Result: {final_checkpoint_status} (Avg Score: {final_checkpoint_score:.2f}%)")
 
         checkpoint_results.append({
             "checkpoint_id": checkpoint_id,
-            "status": status,
-            "score": best_overall_score,
+            "status": final_checkpoint_status,
+            "score": final_checkpoint_score,
             "weight": weight,
             "is_mandatory": is_mandatory,
-            "match_details": best_match_details,
-            "optimal_window_size": best_window_size,
-            "best_segment": best_segment_location
+            "sentence_results": sentence_level_results
         })
 
-    # Calculate final score using real-time heuristic
+    # (The final scoring logic remains the same)
     last_passed_index = -1
     passed_checkpoints = sum(1 for r in checkpoint_results if r["status"] == "PASS")
     
@@ -712,19 +734,12 @@ def check_script_adherence_adaptive_windows(agent_text, agent_segments, script_c
         real_time_adherence_score = round(weighted_score_sum / total_weight, 2) if total_weight > 0 else 0
     else:
         real_time_adherence_score = 0
-
-    # Analyze window size usage (convert keys to strings for MongoDB compatibility)
-    window_size_usage = {}
-    for result in checkpoint_results:
-        ws = str(result["optimal_window_size"])  # Convert to string for MongoDB
-        window_size_usage[ws] = window_size_usage.get(ws, 0) + 1
     
     return {
         "real_time_adherence_score": real_time_adherence_score,
         "script_completion_percentage": script_completion_percentage,
         "checkpoint_results": checkpoint_results,
-        "method": "adaptive_windows_segments",
-        "window_size_usage": window_size_usage,
+        "method": "adaptive_windows_concatenated",
         "total_checkpoints": len(checkpoint_results)
     }
 
