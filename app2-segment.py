@@ -13,6 +13,7 @@ import nltk
 from sentence_transformers import SentenceTransformer, util
 import threading
 from functools import lru_cache
+import traceback # Make sure to import traceback at the top of your file for better error logging
 
 # =============================================================================
 # GLOBAL STATE & HELPERS
@@ -23,6 +24,53 @@ from functools import lru_cache
 # re-transcription of fragmented segments at chunk boundaries.
 # For production, a more robust distributed cache like Redis could be used.
 call_audio_buffers = {}
+
+
+
+def merge_transcription_segments(previous_segments, new_segments, overlap_start_time):
+    """
+    Merges new transcription segments with a previous set by replacing the overlapping portion.
+
+    Args:
+        previous_segments (list): The list of segments from the prior transcription.
+        new_segments (list): The list of segments from the new, overlapping transcription.
+        overlap_start_time (float): The timestamp where the re-transcription began.
+
+    Returns:
+        list: The final, merged list of segments.
+    """
+    if not previous_segments:
+        return new_segments
+
+    # Find the index of the last segment in the previous list that should be replaced.
+    # We remove any segments that started at or after the overlap point.
+    first_segment_to_replace_index = -1
+    for i, segment in enumerate(previous_segments):
+        if segment.get('start', 0) >= overlap_start_time:
+            first_segment_to_replace_index = i
+            break
+
+    # If no segment was found to replace (e.g., silence), just append.
+    if first_segment_to_replace_index == -1:
+        base_segments = previous_segments
+    else:
+        base_segments = previous_segments[:first_segment_to_replace_index]
+
+    # The new segments' timestamps are relative to the start of the audio sent to Whisper.
+    # We need to adjust them to be absolute timestamps in the context of the full call.
+    adjusted_new_segments = []
+    for segment in new_segments:
+        adjusted_segment = segment.copy()
+        adjusted_segment['start'] = round(overlap_start_time + segment['start'], 4)
+        adjusted_segment['end'] = round(overlap_start_time + segment['end'], 4)
+        adjusted_new_segments.append(adjusted_segment)
+
+    # Combine the base segments with the newly transcribed and adjusted ones
+    final_segments = base_segments + adjusted_new_segments
+
+    print(f"[MERGE_SEGMENTS] Merged {len(base_segments)} base segments with {len(adjusted_new_segments)} new segments. Total: {len(final_segments)}")
+    return final_segments
+
 
 def slice_audio(audio_bytes: bytes, start_time_s: float, end_time_s: float = None) -> BytesIO:
     """
@@ -598,7 +646,7 @@ def check_script_adherence_adaptive_windows(agent_text, agent_segments, script_c
         threshold_map = {'STRICT': 85, 'SEMANTIC': 60, 'TOPIC': 40}
         threshold = threshold_map.get(adherence_type, 60)
 
-        print(f"\n[ADHERENCE] Analyzing Checkpoint {i+1}: {checkpoint_id} ({adherence_type})")
+        # print(f"\n[ADHERENCE] Analyzing Checkpoint {i+1}: {checkpoint_id} ({adherence_type})")
 
         sentence_level_results = []
         all_sentence_scores = []
@@ -620,7 +668,7 @@ def check_script_adherence_adaptive_windows(agent_text, agent_segments, script_c
             best_match_info = None
 
             # Test each window size (1, 2, 3)
-            for window_size in range(1, 4):
+            for window_size in range(1, 2):
                 # Create all possible windows of the current size
                 for start_idx in range(len(segment_texts) - window_size + 1):
                     end_idx = start_idx + window_size
@@ -688,9 +736,9 @@ def check_script_adherence_adaptive_windows(agent_text, agent_segments, script_c
             
             agent_match_text = best_match_info['matched_text'] if best_match_info else "No match found"
 
-            print(f"  - Script: '{script_sentence}'")
-            print(f"    Agent Match (Window): '{agent_match_text}' -> Score: {best_score_for_sentence:.2f}% ({sentence_status})")
-            print(f"    Adjusted Score for Averaging: {adjusted_score_for_averaging:.2f}%")
+            # print(f"  - Script: '{script_sentence}'")
+            # print(f"    Agent Match (Window): '{agent_match_text}' -> Score: {best_score_for_sentence:.2f}% ({sentence_status})")
+            # print(f"    Adjusted Score for Averaging: {adjusted_score_for_averaging:.2f}%")
 
             sentence_level_results.append({
                 "script_sentence": script_sentence,
@@ -1203,10 +1251,14 @@ def create_call():
 
 @app.route('/update_call', methods=['POST'])
 def update_call():
+    """
+    Processes an audio chunk for an ongoing call, using an overlapping
+    transcription strategy to improve accuracy at chunk boundaries.
+    """
     print("[ROUTE] POST /update_call")
     
-    client_audio = request.files.get('client_audio')
-    agent_audio = request.files.get('agent_audio')
+    client_audio_chunk = request.files.get('client_audio')
+    agent_audio_chunk = request.files.get('agent_audio')
     call_id = request.form.get('call_id')
     transcript = request.form.get('transcript')
     
@@ -1215,56 +1267,106 @@ def update_call():
         transcript = load_script_from_file("audioscript.txt")
 
     try:
+        # Initialize buffer if it's the first chunk for this call_id
         if call_id not in call_audio_buffers:
-            call_audio_buffers[call_id] = {'agent_audio': BytesIO(), 'client_audio': BytesIO()}
+            print(f"[BUFFER_INIT] Creating new buffer for call_id: {call_id}")
+            call_audio_buffers[call_id] = {
+                'agent_audio': BytesIO(),
+                'client_audio': BytesIO(),
+                'agent_segments': [],
+                'client_segments': []
+            }
         
         call_ops = get_call_operations()
         existing_call = call_ops.get_call(call_id)
         if not existing_call:
             return jsonify({"error": "No record found for the given CallID for updating"}), 404
         
-        existing_transcription = existing_call.get('transcription', {})
+        # --- Process Agent Audio with Overlap ---
+        agent_chunk_bytes = agent_audio_chunk.read() if agent_audio_chunk else b''
+        
+        # 1. Get previous state from buffer
+        previous_agent_full_audio_bytes = call_audio_buffers[call_id]['agent_audio'].getvalue()
+        previous_agent_segments = call_audio_buffers[call_id]['agent_segments']
 
-        # --- Process Agent Audio ---
-        agent_chunk_bytes = agent_audio.read()
-        agent_audio.seek(0)
-        previous_agent_bytes = call_audio_buffers[call_id]['agent_audio'].getvalue()
-        full_agent_audio_bytes = append_wav_chunks(previous_agent_bytes, agent_chunk_bytes)
-        call_audio_buffers[call_id]['agent_audio'] = BytesIO(full_agent_audio_bytes)
+        # 2. Determine the start time for re-transcription
+        agent_overlap_start_time = 0.0
+        if previous_agent_segments:
+            # Start re-transcribing from the beginning of the last known segment
+            agent_overlap_start_time = previous_agent_segments[-1].get('start', 0)
+            print(f"[AGENT_OVERLAP] Determined overlap start time: {agent_overlap_start_time:.2f}s")
+
+        # 3. Create the audio slice to be sent for transcription
+        agent_context_slice_bytes = slice_audio(previous_agent_full_audio_bytes, agent_overlap_start_time).getvalue()
+        agent_audio_for_transcription_bytes = append_wav_chunks(agent_context_slice_bytes, agent_chunk_bytes)
         
-        total_agent_segments = []
-        if full_agent_audio_bytes:
-            _, _, _, all_words = speech_to_text(BytesIO(full_agent_audio_bytes))
-            total_agent_segments = resegment_based_on_punctuation(all_words)
+        # 4. Transcribe the overlapping audio chunk
+        new_agent_segments = []
+        if agent_audio_for_transcription_bytes:
+            print(f"[AGENT_TRANSCRIBE] Sending {len(agent_audio_for_transcription_bytes)} bytes of agent audio for transcription.")
+            _, _, _, all_words = speech_to_text(BytesIO(agent_audio_for_transcription_bytes))
+            # Resegment the new transcription based on punctuation
+            new_agent_segments = resegment_based_on_punctuation(all_words)
         
+        # 5. Merge new segments with the old ones, correcting the overlap
+        total_agent_segments = merge_transcription_segments(
+            previous_agent_segments,
+            new_agent_segments,
+            agent_overlap_start_time
+        )
         total_agent_text = " ".join([s['text'] for s in total_agent_segments]).strip()
 
+        # 6. Update the main buffer with the new full audio and corrected segments
+        full_agent_audio_bytes = append_wav_chunks(previous_agent_full_audio_bytes, agent_chunk_bytes)
+        call_audio_buffers[call_id]['agent_audio'] = BytesIO(full_agent_audio_bytes)
+        call_audio_buffers[call_id]['agent_segments'] = total_agent_segments
 
-        # --- Process Client Audio ---
-        client_chunk_bytes = client_audio.read()
-        client_audio.seek(0)
-        previous_client_bytes = call_audio_buffers[call_id]['client_audio'].getvalue()
-        full_client_audio_bytes = append_wav_chunks(previous_client_bytes, client_chunk_bytes)
-        call_audio_buffers[call_id]['client_audio'] = BytesIO(full_client_audio_bytes)
+        # --- Process Client Audio with Overlap (Same Logic) ---
+        client_chunk_bytes = client_audio_chunk.read() if client_audio_chunk else b''
         
-        total_client_segments = []
-        if full_client_audio_bytes:
-            _, _, _, all_words = speech_to_text(BytesIO(full_client_audio_bytes))
-            total_client_segments = resegment_based_on_punctuation(all_words)
+        # 1. Get previous state
+        previous_client_full_audio_bytes = call_audio_buffers[call_id]['client_audio'].getvalue()
+        previous_client_segments = call_audio_buffers[call_id]['client_segments']
         
+        # 2. Determine overlap start time
+        client_overlap_start_time = 0.0
+        if previous_client_segments:
+            client_overlap_start_time = previous_client_segments[-1].get('start', 0)
+            print(f"[CLIENT_OVERLAP] Determined overlap start time: {client_overlap_start_time:.2f}s")
+            
+        # 3. Create audio for transcription
+        client_context_slice_bytes = slice_audio(previous_client_full_audio_bytes, client_overlap_start_time).getvalue()
+        client_audio_for_transcription_bytes = append_wav_chunks(client_context_slice_bytes, client_chunk_bytes)
+        
+        # 4. Transcribe
+        new_client_segments = []
+        if client_audio_for_transcription_bytes:
+            print(f"[CLIENT_TRANSCRIBE] Sending {len(client_audio_for_transcription_bytes)} bytes of client audio for transcription.")
+            _, _, _, all_words = speech_to_text(BytesIO(client_audio_for_transcription_bytes))
+            new_client_segments = resegment_based_on_punctuation(all_words)
+
+        # 5. Merge
+        total_client_segments = merge_transcription_segments(
+            previous_client_segments,
+            new_client_segments,
+            client_overlap_start_time
+        )
         total_client_text = " ".join([s['text'] for s in total_client_segments]).strip()
-
+        
+        # 6. Update buffer
+        full_client_audio_bytes = append_wav_chunks(previous_client_full_audio_bytes, client_chunk_bytes)
+        call_audio_buffers[call_id]['client_audio'] = BytesIO(full_client_audio_bytes)
+        call_audio_buffers[call_id]['client_segments'] = total_client_segments
         
         # --- Analysis and Response ---
-        # Finalize and Analyze
         if not total_agent_text and not total_client_text:
-            return jsonify({"status": "success", "message": "Audio silent, no analysis."}), 200
+            return jsonify({"status": "success", "message": "Audio silent, no analysis performed."}), 200
 
-        # This duration is now an approximation of the chunk, not the whole call
+        # This duration approximates the current chunk's length
         duration = max(len(agent_chunk_bytes), len(client_chunk_bytes)) / 32000 
         
+        # Prepare data for analysis
         script_checkpoints = get_current_call_script(transcript)
-        
         combined_transcription = f"Agent: {total_agent_text}\nClient: {total_client_text}".strip()
         
         processed_agent_segments = process_whisper_segments(total_agent_segments)
@@ -1283,8 +1385,7 @@ def update_call():
             "client_segments": total_client_segments
         }
 
-        stored_audio_result = call_ops.store_audio_and_update_call(call_id, agent_audio, client_audio, is_final=False)
-        
+        # Perform analysis on the full, corrected transcriptions
         results = check_script_adherence_adaptive_windows(total_agent_text, processed_agent_segments, script_checkpoints)
         overall_adherence = results.get("real_time_adherence_score", 0)
         script_completion = results.get("script_completion_percentage", 0)
@@ -1300,6 +1401,7 @@ def update_call():
         CQS, emotions = calculate_cqs(response["predictions"])
         quality = get_quality(emotions)
 
+        # Update the database with the latest partial results
         call_ops.insert_partial_update(call_id, duration, CQS, adherence_data, emotions, all_transcription, quality)
 
         return jsonify({
@@ -1312,6 +1414,8 @@ def update_call():
     
     except Exception as e:
         print(f"[UPDATE_CALL ERROR] An unexpected error occurred: {e}")
+        # Print the full traceback to the console for easier debugging
+        traceback.print_exc()
         return jsonify({"error": "An unexpected server error occurred"}), 500
 
 @app.route('/final_update', methods=['POST'])
