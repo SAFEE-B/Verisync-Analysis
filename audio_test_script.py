@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Audio Chunking Test Script for app2.py
+Audio Chunking Test Script for app2-segment.py
 
 This script:
 1. Creates an initial call record in the MongoDB database
@@ -9,9 +9,10 @@ This script:
 4. Uses /update_call for intermediate chunks and /final_update for the last chunk
 5. Simulates a real-time call analysis scenario with proper database integration
 6. Provides detailed logging and error handling
+7. Supports sending transcript data for script adherence analysis
 
 Usage:
-    python audio_test_script.py --audio_file path/to/audio.wav [--server_url http://localhost:5000] [--chunk_duration 10] [--call_id test_call_123]
+    python audio_test_script.py --audio_file path/to/audio.wav [--server_url http://localhost:5000] [--chunk_duration 10] [--call_id test_call_123] [--transcript path/to/script.xml]
 """
 
 import argparse
@@ -55,6 +56,29 @@ class AudioChunkTester:
             print(f"[ERROR] Failed to load audio file: {e}")
             return None
     
+    def load_transcript(self, transcript_file_path):
+        """Load transcript/script file and return content"""
+        try:
+            print(f"[TRANSCRIPT] Loading transcript file: {transcript_file_path}")
+            
+            # Check file exists
+            if not os.path.exists(transcript_file_path):
+                raise FileNotFoundError(f"Transcript file not found: {transcript_file_path}")
+            
+            # Load transcript content
+            with open(transcript_file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            print(f"[TRANSCRIPT] Transcript loaded successfully:")
+            print(f"[TRANSCRIPT] - File size: {len(content)} characters")
+            print(f"[TRANSCRIPT] - First 100 chars: {content[:100]}...")
+            
+            return content
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to load transcript file: {e}")
+            return None
+    
     def create_chunks(self, audio):
         """Split audio into chunks of specified duration"""
         try:
@@ -84,7 +108,7 @@ class AudioChunkTester:
             print(f"[ERROR] Failed to convert audio to WAV bytes: {e}")
             return None
     
-    def send_chunk(self, chunk_index, total_chunks, client_audio_chunk, agent_audio_chunk, call_id, custom_script=None):
+    def send_chunk(self, chunk_index, total_chunks, client_audio_chunk, agent_audio_chunk, call_id, transcript_content=None):
         """Send a chunk to the appropriate endpoint"""
         try:
             is_final = (chunk_index == total_chunks - 1)
@@ -104,16 +128,16 @@ class AudioChunkTester:
             
             # Prepare form data
             data = {'call_id': call_id}
-            if custom_script:
-                data['transcript'] = custom_script
+            if transcript_content:
+                data['transcript'] = transcript_content
             
             chunk_type = "FINAL" if is_final else "UPDATE"
             print(f"[SEND] Sending chunk {chunk_index + 1}/{total_chunks} ({chunk_type}) to {endpoint}")
             print(f"[SEND] - Call ID: {call_id}")
             print(f"[SEND] - Client audio: {'✓' if client_wav else '✗'}")
             print(f"[SEND] - Agent audio: {'✓' if agent_wav else '✗'}")
-            if custom_script:
-                print(f"[SEND] - Custom script: {len(custom_script)} chars")
+            if transcript_content:
+                print(f"[SEND] - Transcript: {len(transcript_content)} chars")
             
             # Send request
             start_time = time.time()
@@ -135,20 +159,46 @@ class AudioChunkTester:
                         print(f"[RESULT] - CQS: {result['CQS']:.2f}")
                     if 'quality' in result:
                         print(f"[RESULT] - Quality: {result['quality']:.1f}%")
+                    if 'adherence_details' in result:
+                        details = result['adherence_details']
+                        found_count = sum(1 for d in details if d.get('found', False))
+                        print(f"[RESULT] - Checkpoints found: {found_count}/{len(details)}")
+                    if 'analysis_method' in result:
+                        print(f"[RESULT] - Analysis method: {result['analysis_method']}")
+                    if 'window_size_usage' in result:
+                        usage = result['window_size_usage']
+                        print(f"[RESULT] - Window usage: S:{usage.get('small', 0)} M:{usage.get('medium', 0)} L:{usage.get('large', 0)}")
 
                 # Show final analysis for last chunk
                 if is_final:
                     if 'final_adherence' in result:
                         final = result['final_adherence']
                         print(f"[FINAL] Final Analysis Complete:")
-                        if 'real_time_score' in final:
-                            print(f"[FINAL] - Real-time score: {final.get('real_time_score', 0):.1f}%")
-                        if 'script_completion' in final:
-                            print(f"[FINAL] - Script completion: {final.get('script_completion', 0):.1f}%")
-                        if 'analysis_method' in final:
-                            print(f"[FINAL] - Analysis method: {final.get('analysis_method', 'unknown')}")
-                        if 'total_checkpoints' in final:
-                            print(f"[FINAL] - Total checkpoints: {final.get('total_checkpoints', 0)}")
+                        print(f"[FINAL] - Overall adherence: {final.get('overall', 0):.1f}%")
+                        print(f"[FINAL] - Script completion: {final.get('script_completion', 0):.1f}%")
+                        print(f"[FINAL] - Analysis method: {final.get('method', 'unknown')}")
+                        print(f"[FINAL] - Total checkpoints: {final.get('total_checkpoints', 0)}")
+                        if 'window_size_usage' in final:
+                            usage = final['window_size_usage']
+                            print(f"[FINAL] - Window usage: S:{usage.get('small', 0)} M:{usage.get('medium', 0)} L:{usage.get('large', 0)}")
+                        if 'details' in final:
+                            details = final['details']
+                            found_count = sum(1 for d in details if d.get('found', False))
+                            print(f"[FINAL] - Checkpoints found: {found_count}/{len(details)}")
+                    
+                    # Show final emotion analysis
+                    if 'final_emotions' in result:
+                        final_emotions = result['final_emotions']
+                        print(f"[FINAL] Final Emotion Analysis:")
+                        print(f"[FINAL] - Final CQS: {final_emotions.get('cqs', 0):.2f}")
+                        print(f"[FINAL] - Final Quality: {final_emotions.get('quality', 0):.1f}%")
+                        emotions = final_emotions.get('emotions', {})
+                        if emotions:
+                            top_emotions = sorted(emotions.items(), key=lambda x: x[1], reverse=True)[:3]
+                            print(f"[FINAL] - Top emotions: {', '.join([f'{e}({s:.2f})' for e, s in top_emotions])}")
+                    
+                    if 'chunk_emotions_count' in result:
+                        print(f"[FINAL] - Total emotion chunks: {result['chunk_emotions_count']}")
                     
                     if 'total_duration' in result:
                         print(f"[FINAL] - Total duration: {result['total_duration']:.2f}s")
@@ -179,7 +229,7 @@ class AudioChunkTester:
             return True
         except requests.exceptions.ConnectionError:
             print(f"[ERROR] Cannot connect to server at {self.server_url}")
-            print(f"[ERROR] Make sure app2.py is running on this URL")
+            print(f"[ERROR] Make sure app2-segment.py is running on this URL")
             return False
         except Exception as e:
             # If we get a 404, that means the server is running but the endpoint doesn't exist
@@ -190,7 +240,7 @@ class AudioChunkTester:
             print(f"[ERROR] Connection test failed: {e}")
             return False
     
-    def create_call_record(self, call_id=None, agent_id=None, customer_id=None, script_text=None):
+    def create_call_record(self, call_id=None, agent_id=None, customer_id=None, transcript_content=None):
         """Create initial call record via API endpoint"""
         if call_id:
             print(f"[API] Using provided custom call_id: {call_id}")
@@ -203,15 +253,16 @@ class AudioChunkTester:
             print(f"[API] Creating call record in database...")
             url = f"{self.server_url}/create_call"
             
-            # Prepare form data (app2.py expects form data, not JSON)
+            # Prepare form data (app2-segment.py expects form data, not JSON)
             data = {
                 'call_id': call_id,
                 'agent_id': agent_id or 'test_agent_from_script',
                 'customer_id': customer_id or 'test_customer_from_script'
             }
             
-            if script_text:
-                data['transcript'] = script_text
+            if transcript_content:
+                data['transcript'] = transcript_content
+                print(f"[API] Including transcript in call creation ({len(transcript_content)} chars)")
             
             response = self.session.post(url, data=data, timeout=20)
             
@@ -232,7 +283,7 @@ class AudioChunkTester:
             print(f"[API] Will attempt to use call_id: {call_id}")
             return call_id
     
-    def run_test(self, audio_file_path, call_id=None, custom_script=None, test_mode="both", agent_id=None, customer_id=None):
+    def run_test(self, audio_file_path, call_id=None, transcript_content=None, test_mode="both", agent_id=None, customer_id=None):
         """
         Run the complete audio chunking test
         
@@ -242,20 +293,24 @@ class AudioChunkTester:
         - "agent_only": Send all chunks as agent audio
         - "both": Send same chunk to both client and agent
         """
-        print("="*60)
-        print("AUDIO CHUNKING TEST SCRIPT")
-        print("="*60)
+        print("="*80)
+        print("AUDIO CHUNKING TEST SCRIPT WITH TRANSCRIPT SUPPORT")
+        print("="*80)
         
         # Test server connection
         if not self.test_server_connection():
             return False
         
         # Create call record in database or use provided call_id
-        call_id = self.create_call_record(call_id, agent_id, customer_id, custom_script)
+        call_id = self.create_call_record(call_id, agent_id, customer_id, transcript_content)
         
         print(f"[INFO] Call ID: {call_id}")
         print(f"[INFO] Test mode: {test_mode}")
         print(f"[INFO] Chunk duration: {self.chunk_duration/1000}s")
+        if transcript_content:
+            print(f"[INFO] Transcript: {len(transcript_content)} characters loaded")
+        else:
+            print(f"[INFO] Transcript: None (will use default script)")
         
         # Load and chunk audio
         audio = self.load_audio(audio_file_path)
@@ -268,7 +323,7 @@ class AudioChunkTester:
         
         # Process chunks
         print(f"[INFO] Processing {len(chunks)} chunks...")
-        print("-" * 40)
+        print("-" * 60)
         
         successful_chunks = 0
         failed_chunks = 0
@@ -291,35 +346,38 @@ class AudioChunkTester:
                 client_audio = chunk
                 agent_audio = chunk
             
-            # Send chunk
-            result = self.send_chunk(i, len(chunks), client_audio, agent_audio, call_id, custom_script)
+            # Send chunk with transcript data
+            result = self.send_chunk(i, len(chunks), client_audio, agent_audio, call_id, transcript_content)
             
             if result:
                 successful_chunks += 1
             else:
                 failed_chunks += 1
             
-            print("-" * 40)
+            print("-" * 60)
             
             # Small delay between chunks to avoid overwhelming server
             if i < len(chunks) - 1:
                 time.sleep(0.5)
         
         # Summary
-        print("="*60)
+        print("="*80)
         print("TEST SUMMARY")
-        print("="*60)
+        print("="*80)
         print(f"[SUMMARY] Total chunks: {len(chunks)}")
         print(f"[SUMMARY] Successful: {successful_chunks}")
         print(f"[SUMMARY] Failed: {failed_chunks}")
         print(f"[SUMMARY] Success rate: {(successful_chunks/len(chunks)*100):.1f}%")
         print(f"[SUMMARY] Call ID: {call_id}")
+        print(f"[SUMMARY] Test mode: {test_mode}")
+        if transcript_content:
+            print(f"[SUMMARY] Transcript: {len(transcript_content)} characters processed")
         print(f"[SUMMARY] Database record created and updated successfully")
         
         return successful_chunks > 0
 
 def main():
-    parser = argparse.ArgumentParser(description='Test audio chunking with app2.py - Creates database records and sends chunked audio')
+    parser = argparse.ArgumentParser(description='Test audio chunking with app2-segment.py - Creates database records and sends chunked audio with transcript support')
     parser.add_argument('--audio_file', required=True, help='Path to WAV audio file')
     parser.add_argument('--server_url', default='http://localhost:5000', help='Server URL (default: http://localhost:5000)')
     parser.add_argument('--chunk_duration', type=int, default=10, help='Chunk duration in seconds (default: 10)')
@@ -328,19 +386,17 @@ def main():
     parser.add_argument('--customer_id', default='test_customer', help='Customer ID for database record (default: test_customer)')
     parser.add_argument('--test_mode', choices=['alternating', 'client_only', 'agent_only', 'both'], 
                         default='both', help='How to distribute chunks (default: both - sends same chunk to both streams)')
-    parser.add_argument('--script', help='Path to custom script file in XML format')
+    parser.add_argument('--transcript', help='Path to transcript/script file (XML format) for adherence analysis')
     
     args = parser.parse_args()
     
-    # Load custom script if provided
-    custom_script = None
-    if args.script:
-        try:
-            with open(args.script, 'r', encoding='utf-8') as f:
-                custom_script = f.read()
-            print(f"[INFO] Loaded custom script from {args.script} ({len(custom_script)} characters)")
-        except Exception as e:
-            print(f"[ERROR] Failed to load script file: {e}")
+    # Load transcript if provided
+    transcript_content = None
+    if args.transcript:
+        tester_temp = AudioChunkTester()  # Temporary instance just for loading transcript
+        transcript_content = tester_temp.load_transcript(args.transcript)
+        if not transcript_content:
+            print(f"[ERROR] Failed to load transcript file: {args.transcript}")
             return False
     
     # Create tester and run
@@ -348,7 +404,7 @@ def main():
     success = tester.run_test(
         args.audio_file, 
         args.call_id, 
-        custom_script, 
+        transcript_content, 
         args.test_mode,
         args.agent_id,
         args.customer_id

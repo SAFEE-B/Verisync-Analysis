@@ -364,13 +364,13 @@ def get_semantic_match(current_text, script_sentences, model):
             similarity = util.cos_sim(current_embedding, script_emb).item()
             similarities.append(similarity)
             script_text = script_sentences[idx]
-            print(f"[SEMANTIC] - Script {idx+1}: '{script_text[:40]}{'...' if len(script_text) > 40 else ''}' → {similarity:.3f} ({similarity*100:.1f}%)")
+            # print(f"[SEMANTIC] - Script {idx+1}: '{script_text[:40]}{'...' if len(script_text) > 40 else ''}' → {similarity:.3f} ({similarity*100:.1f}%)")
         
         max_similarity = max(similarities)
         best_match_idx = similarities.index(max_similarity)
         best_script = script_sentences[best_match_idx]
         
-        print(f"[SEMANTIC] Best match: Script {best_match_idx+1} '{best_script[:50]}{'...' if len(best_script) > 50 else ''}' with {max_similarity:.3f} ({max_similarity*100:.1f}%)")
+        # print(f"[SEMANTIC] Best match: Script {best_match_idx+1} '{best_script[:50]}{'...' if len(best_script) > 50 else ''}' with {max_similarity:.3f} ({max_similarity*100:.1f}%)")
         
         return max_similarity
     except Exception as e:
@@ -385,8 +385,8 @@ def process_whisper_segments(segments):
         print("[SEGMENTS] No segments provided, returning empty list")
         return []
     
-    print(f"[SEGMENTS] ========== Processing Whisper Segments ==========")
-    print(f"[SEGMENTS] Processing {len(segments)} segments from Whisper")
+    # print(f"[SEGMENTS] ========== Processing Whisper Segments ==========")
+    # print(f"[SEGMENTS] Processing {len(segments)} segments from Whisper")
     
     processed_segments = []
     
@@ -413,7 +413,7 @@ def process_whisper_segments(segments):
         word_count = len(text.split())
         duration = end_time - start_time
         
-        print(f"[SEGMENTS] Segment {i+1}: '{text}' ({word_count} words, {duration:.2f}s)")
+        # print(f"[SEGMENTS] Segment {i+1}: '{text}' ({word_count} words, {duration:.2f}s)")
         
         processed_segment = {
             'start_time': start_time,
@@ -430,8 +430,8 @@ def process_whisper_segments(segments):
         
         processed_segments.append(processed_segment)
     
-    print(f"[SEGMENTS] ========== Segment Processing Complete ==========")
-    print(f"[SEGMENTS] Processed {len(processed_segments)} valid segments")
+    # print(f"[SEGMENTS] ========== Segment Processing Complete ==========")
+    # print(f"[SEGMENTS] Processed {len(processed_segments)} valid segments")
     
     return processed_segments
 
@@ -560,7 +560,7 @@ def get_current_call_script(script_text=None):
     
     # Final safety check - if even default script fails, create a minimal fallback
     if not checkpoints:
-        print("[SCRIPT] ERROR: All scripts failed to parse, creating minimal fallback")
+        # print("[SCRIPT] ERROR: All scripts failed to parse, creating minimal fallback")
         return [{
             "checkpoint_id": "fallback_greeting",
             "prompt_text": "Hello, how can I help you?",
@@ -736,7 +736,7 @@ def check_script_adherence_adaptive_windows(agent_text, agent_segments, script_c
         # NEW LOGIC: Checkpoint passes if average adjusted score > 60
         final_checkpoint_status = "PASS" if final_checkpoint_score > 60 else "FAIL"
         
-        print(f"[ADHERENCE] Checkpoint Result: {final_checkpoint_status} (Avg Score: {final_checkpoint_score:.2f}%)")
+        # print(f"[ADHERENCE] Checkpoint Result: {final_checkpoint_status} (Avg Score: {final_checkpoint_score:.2f}%)")
 
         checkpoint_results.append({
             "checkpoint_id": checkpoint_id,
@@ -877,25 +877,27 @@ def detect_voice_activity(audio_file, min_speech_duration=0.5, min_silence_durat
 def speech_to_text(audio):
     """Convert audio to text using Groq Whisper API with segment-based processing, using no_speech_prob for silence detection."""
     try:
+        t0 = time.time()
+        
+        # Define a threshold for filtering out silent segments
+        NO_SPEECH_SEGMENT_THRESHOLD = 0.80 
+
         audio_copy = BytesIO()
         audio.seek(0)
         audio_copy.write(audio.read())
         audio_copy.seek(0)
+        t1 = time.time()
+        print(f"[TIMER] [speech_to_text] Audio copy: {t1-t0:.3f}s")
         
         buffer_data = audio_copy.read()
         audio_copy.seek(0)
-        
         if len(buffer_data) < 44:
+            print(f"[TIMER] [speech_to_text] Audio too short, total: {time.time()-t0:.3f}s")
             return "", 0, [], []
         
-        # Voice Activity Detection (SAD) - keep commented for reference
-        # vad_result = detect_voice_activity(audio_copy, min_speech_duration=0.3, min_silence_duration=0.1)
-        # if not vad_result['has_speech']:
-        #     return "", vad_result['total_audio_duration'], [], []
-        
-        # Groq Whisper API transcription with segment granularity
         audio_copy.name = "audio.wav"
-        
+        t2 = time.time()
+        print(f"[TIMER] [speech_to_text] Pre-API prep: {t2-t1:.3f}s")
         print(f"[API REQUEST] Calling Groq Whisper API for segment-based transcription.")
         response = client.audio.transcriptions.create(
             model="whisper-large-v3-turbo",
@@ -904,67 +906,41 @@ def speech_to_text(audio):
             response_format="verbose_json",
             timestamp_granularities=["segment", "word"]
         )
-        
+        t3 = time.time()
+        print(f"[TIMER] [speech_to_text] Whisper API call: {t3-t2:.3f}s")
         print("[API RESPONSE] Groq Whisper segment transcription completed", response)
         
-        # Extract no_speech_prob and duration from response
-        no_speech_prob = None
-        duration = 0
-        if hasattr(response, 'no_speech_prob'):
-            no_speech_prob = getattr(response, 'no_speech_prob', None)
-            print("NSP",no_speech_prob)
-        elif isinstance(response, dict):
-            no_speech_prob = response.get('no_speech_prob', None)
-        
-        if hasattr(response, 'duration'):
-            duration = getattr(response, 'duration', 0)
-            print("DURR",duration)
-        elif isinstance(response, dict):
-            duration = response.get('duration', 0)
-        
-        # If no_speech_prob is high, treat as silent
-        if no_speech_prob is not None and no_speech_prob > 0.7:
-            print(f"[SILENCE DETECTED] no_speech_prob={no_speech_prob}, treating as silent.")
-            return "", duration, [], []
-        
-        if hasattr(response, 'text'):
-            transcription = response.text or ""
-        else:
-            transcription = response.get('text', '') if isinstance(response, dict) else ""
-        
-        # Process segment-level data
+        duration = getattr(response, 'duration', 0)
+
+        # Process segment-level data and filter based on no_speech_prob
         segment_data = []
-        segments = None
-        if hasattr(response, 'segments') and response.segments:
-            segments = response.segments
-        elif isinstance(response, dict) and 'segments' in response and response['segments']:
-            segments = response['segments']
+        word_data = []
+        valid_segments_text = [] # To store the text of valid segments
+
+        segments = getattr(response, 'segments', [])
         
         if segments:
             for segment in segments:
-                if hasattr(segment, 'text') and hasattr(segment, 'start') and hasattr(segment, 'end'):
-                    segment_data.append({
-                        'text': segment.text.strip(),
-                        'start': segment.start,
-                        'end': segment.end,
-                        'confidence': getattr(segment, 'avg_logprob', 0.0)
-                    })
-                elif isinstance(segment, dict):
-                    segment_data.append({
-                        'text': segment.get('text', '').strip(),
-                        'start': segment.get('start', 0),
-                        'end': segment.get('end', 0),
-                        'confidence': segment.get('avg_logprob', 0.0)
-                    })
-        
-        # Process word-level data
-        word_data = []
-        words = None
-        if hasattr(response, 'words') and response.words:
-            words = response.words
-        elif isinstance(response, dict) and 'words' in response and response['words']:
-            words = response['words']
+                # Check if the segment's no_speech_prob is below our threshold
+                segment_no_speech_prob = segment.get('no_speech_prob', 0.0)
+                if segment_no_speech_prob < NO_SPEECH_SEGMENT_THRESHOLD:
+                    text = segment.get('text', '').strip()
+                    if text:
+                        segment_data.append({
+                            'text': text,
+                            'start': segment.get('start', 0),
+                            'end': segment.get('end', 0),
+                            'confidence': segment.get('avg_logprob', 0.0)
+                        })
+                        valid_segments_text.append(text)
+                else:
+                    print(f"[SILENCE_FILTER] Skipping segment with no_speech_prob: {segment_no_speech_prob:.2f}")
 
+        # Reconstruct the final transcription from only the valid segments
+        transcription = " ".join(valid_segments_text).strip()
+
+        # Process word-level data (can also be filtered by time if needed)
+        words = getattr(response, 'words', [])
         if words:
             for word in words:
                 word_data.append({
@@ -973,7 +949,21 @@ def speech_to_text(audio):
                     'end': word.get('end', 0)
                 })
 
+        t4 = time.time()
+        print(f"[TIMER] [speech_to_text] Post-processing: {t4-t3:.3f}s, Total: {t4-t0:.3f}s")
         return transcription, duration, segment_data, word_data
+        
+    except Exception as e:
+        error_message = str(e)
+        
+        if "rate_limit" in error_message.lower() or "429" in error_message:
+            print(f"[API ERROR] Groq API Rate Limit: {error_message}")
+            time.sleep(30) # Wait before retrying
+            # (Retry logic can be added here if necessary)
+            return "", 0, [], []
+        else:
+            print(f"[API ERROR] Groq API error: {error_message}")
+            return "", 0, [], []
         
     except Exception as e:
         error_message = str(e)
@@ -1277,73 +1267,67 @@ def _process_audio_for_update(call_id, speaker_type, audio_chunk_bytes):
 
 @app.route('/update_call', methods=['POST'])
 def update_call():
-    """
-    Processes audio chunks concurrently using a thread-safe, overlapping strategy.
-    """
     print("[ROUTE] POST /update_call")
-    
+    t0 = time.time()
     call_id = request.form.get('call_id')
     transcript = request.form.get('transcript') or load_script_from_file("audioscript.txt")
-
     agent_chunk_bytes = request.files.get('agent_audio').read() if request.files.get('agent_audio') else b''
     client_chunk_bytes = request.files.get('client_audio').read() if request.files.get('client_audio') else b''
-
     try:
+        t1 = time.time()
         call_lock = get_lock_for_call(call_id)
         with call_lock:
-            # Initialize buffer if it's the first chunk for this call_id
             if call_id not in call_audio_buffers:
                 print(f"[BUFFER_INIT] Creating new buffer for call_id: {call_id}")
                 call_audio_buffers[call_id] = {
                     'agent_audio': BytesIO(), 'client_audio': BytesIO(),
                     'agent_segments': [], 'client_segments': []
                 }
-        
+        t2 = time.time()
+        print(f"[TIMER] Buffer init/check: {t2-t1:.3f}s")
         call_ops = get_call_operations()
         if not call_ops.get_call(call_id):
             return jsonify({"error": "No record found for the given CallID for updating"}), 404
-
-        # Process agent and client audio in parallel
+        t3 = time.time()
+        print(f"[TIMER] DB get_call: {t3-t2:.3f}s")
         agent_future = executor.submit(_process_audio_for_update, call_id, 'agent', agent_chunk_bytes)
         client_future = executor.submit(_process_audio_for_update, call_id, 'client', client_chunk_bytes)
-        
         total_agent_segments = agent_future.result()
         total_client_segments = client_future.result()
-
+        t4 = time.time()
+        print(f"[TIMER] Audio processing (agent+client): {t4-t3:.3f}s")
         total_agent_text = " ".join([s['text'] for s in total_agent_segments]).strip()
         total_client_text = " ".join([s['text'] for s in total_client_segments]).strip()
-
-        # --- Analysis and Response ---
         if not total_agent_text and not total_client_text:
+            print(f"[TIMER] Silent audio, total: {time.time()-t0:.3f}s")
             return jsonify({"status": "success", "message": "Audio silent, no analysis performed."}), 200
-
-        # ... (rest of the analysis logic is the same)
         script_checkpoints = get_current_call_script(transcript)
         processed_agent_segments = process_whisper_segments(total_agent_segments)
-
+        t5 = time.time()
+        print(f"[TIMER] Script+segment processing: {t5-t4:.3f}s")
         results = check_script_adherence_adaptive_windows(total_agent_text, processed_agent_segments, script_checkpoints)
         adherence_data = {
             'overall': results.get("real_time_adherence_score", 0),
             'script_completion': results.get("script_completion_percentage", 0),
             'details': results.get("checkpoint_results", [])
         }
-        
+        t6 = time.time()
+        print(f"[TIMER] Adherence analysis: {t6-t5:.3f}s")
         response = get_response(total_client_text)
         CQS, emotions = calculate_cqs(response["predictions"])
         quality = get_quality(emotions)
-
-        # Construct transcription object for DB update
+        t7 = time.time()
+        print(f"[TIMER] Emotion/CQS/quality: {t7-t6:.3f}s")
         all_transcription = { "agent": total_agent_text, "client": total_client_text }
-
         call_ops.insert_partial_update(call_id, 0, CQS, adherence_data, emotions, all_transcription, quality)
-
+        t8 = time.time()
+        print(f"[TIMER] DB partial update: {t8-t7:.3f}s, Total: {t8-t0:.3f}s")
         return jsonify({
             "status": "success",
             "call_id": call_id,
             "overall_adherence": adherence_data['overall'],
             "script_completion": adherence_data['script_completion'],
         })
-    
     except Exception as e:
         print(f"[UPDATE_CALL ERROR] An unexpected error occurred: {e}")
         traceback.print_exc()
@@ -1351,77 +1335,66 @@ def update_call():
 
 
 def _transcribe_final_audio(audio_bytes):
-    """Helper for final transcription."""
+    t0 = time.time()
     if not audio_bytes:
+        print(f"[TIMER] _transcribe_final_audio: empty input, total: {time.time()-t0:.3f}s")
         return [], ""
     _, _, _, all_words = speech_to_text(BytesIO(audio_bytes))
     final_segments = resegment_based_on_punctuation(all_words)
     final_text = " ".join([s['text'] for s in final_segments]).strip()
+    print(f"[TIMER] _transcribe_final_audio: {time.time()-t0:.3f}s")
     return final_segments, final_text
 
 
 @app.route('/final_update', methods=['POST'])
 def final_update():
     print("[ROUTE] POST /final_update")
-    
+    t0 = time.time()
     call_id = request.form.get('call_id')
     transcript = request.form.get('transcript') or load_script_from_file("audioscript.txt")
-    
     try:
         call_ops = get_call_operations()
         existing_call = call_ops.get_call(call_id)
         if not existing_call:
             return jsonify({"error": "No record found for the given CallID"}), 404
-
-        # Append final chunk to the buffer
         agent_chunk_bytes = request.files.get('agent_audio').read() if request.files.get('agent_audio') else b''
         client_chunk_bytes = request.files.get('client_audio').read() if request.files.get('client_audio') else b''
-
         call_lock = get_lock_for_call(call_id)
         with call_lock:
             previous_agent_bytes = call_audio_buffers.get(call_id, {}).get('agent_audio', BytesIO()).getvalue()
             full_agent_audio_bytes = append_wav_chunks(previous_agent_bytes, agent_chunk_bytes)
-            
             previous_client_bytes = call_audio_buffers.get(call_id, {}).get('client_audio', BytesIO()).getvalue()
             full_client_audio_bytes = append_wav_chunks(previous_client_bytes, client_chunk_bytes)
-
-        # --- Concurrent Final Transcription and Analysis ---
+        t1 = time.time()
+        print(f"[TIMER] Audio prep: {t1-t0:.3f}s")
         with ThreadPoolExecutor(max_workers=5) as final_executor:
-            # Step 1: Transcribe final audio for both parties concurrently
             agent_transcription_future = final_executor.submit(_transcribe_final_audio, full_agent_audio_bytes)
             client_transcription_future = final_executor.submit(_transcribe_final_audio, full_client_audio_bytes)
-
             final_agent_segments, final_agent_text = agent_transcription_future.result()
             final_client_segments, final_client_text = client_transcription_future.result()
-
+            t2 = time.time()
+            print(f"[TIMER] Final transcription: {t2-t1:.3f}s")
             combined_transcription = f"Agent: {final_agent_text}\nClient: {final_client_text}".strip()
-
-            # Step 2: Run all independent analyses concurrently
             adherence_future = final_executor.submit(check_script_adherence_adaptive_windows, final_agent_text, final_agent_segments, get_current_call_script(transcript))
             emotion_future = final_executor.submit(get_response, final_client_text)
             agent_quality_future = final_executor.submit(agent_scores, combined_transcription)
             summary_future = final_executor.submit(call_summary, final_agent_text, final_client_text)
             tags_future = final_executor.submit(get_tags, combined_transcription)
-            
-            # Collect results
             adherence_results = adherence_future.result()
             emotion_response = emotion_future.result()
             agent_quality = agent_quality_future.result()
             summary = summary_future.result()
             tags_obj = tags_future.result()
-
-        # Process results
+            t3 = time.time()
+            print(f"[TIMER] Final analysis (adherence, emotion, etc): {t3-t2:.3f}s")
         CQS, emotions = calculate_cqs(emotion_response["predictions"])
         quality = get_quality(emotions)
         tags = ', '.join(tags_obj.get('Tags', []))
-
         final_adherence_data = {
             "overall": adherence_results.get("real_time_adherence_score", 0),
             "script_completion": adherence_results.get("script_completion_percentage", 0),
             "details": adherence_results.get("checkpoint_results", [])
         }
-
-        # --- Final Database Update ---
         call_ops.complete_call_update(
             call_id=call_id,
             agent_text=final_agent_text, client_text=final_client_text,
@@ -1430,12 +1403,10 @@ def final_update():
             summary=summary, emotions=emotions, duration=existing_call.get('duration', 0),
             quality=quality, tags=tags, agent_segments=final_agent_segments, client_segments=final_client_segments
         )
-        
-        # Cleanup resources for the completed call
+        t4 = time.time()
+        print(f"[TIMER] Final DB update: {t4-t3:.3f}s, Total: {t4-t0:.3f}s")
         cleanup_call_resources(call_id)
-
         return jsonify({"status": "success", "message": "Call analysis completed.", "call_id": call_id})
-    
     except Exception as e:
         print(f"[FINAL_UPDATE ERROR] An unexpected error occurred: {e}")
         traceback.print_exc()

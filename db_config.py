@@ -1,10 +1,11 @@
 import os
 from pymongo import MongoClient
 from gridfs import GridFS
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from typing import Optional, Dict, Any, List
 from bson import ObjectId
+import threading
 
 class MongoDB:
     """MongoDB connection and operations manager with GridFS support for audio storage"""
@@ -14,6 +15,7 @@ class MongoDB:
         self.db = None
         self.fs = None
         self.calls_collection = None
+        self._gridfs_lock = threading.Lock()  # Thread safety for GridFS operations
         self.connect()
     
     def connect(self):
@@ -83,10 +85,59 @@ class MongoDB:
             self.client.close()
             print("[DB] MongoDB connection closed")
     
+    def _combine_wav_audio(self, existing_audio: bytes, new_audio: bytes) -> bytes:
+        """
+        Properly combine two WAV audio streams using torchaudio
+        
+        Args:
+            existing_audio: Existing audio bytes
+            new_audio: New audio bytes to append
+            
+        Returns:
+            Combined audio bytes
+        """
+        if not new_audio:
+            return existing_audio
+        if not existing_audio:
+            return new_audio
+            
+        try:
+            import torchaudio
+            import torch
+            from io import BytesIO
+            
+            # Load both audio streams
+            existing_buffer = BytesIO(existing_audio)
+            new_buffer = BytesIO(new_audio)
+            
+            existing_waveform, sr1 = torchaudio.load(existing_buffer)
+            new_waveform, sr2 = torchaudio.load(new_buffer)
+            
+            # Handle sample rate mismatch
+            if sr1 != sr2:
+                print(f"[DB_AUDIO] Sample rate mismatch: {sr1} vs {sr2}. Resampling to {sr1}.")
+                resampler = torchaudio.transforms.Resample(sr2, sr1)
+                new_waveform = resampler(new_waveform)
+            
+            # Concatenate waveforms
+            combined_waveform = torch.cat((existing_waveform, new_waveform), dim=1)
+            
+            # Save back to WAV format
+            output_buffer = BytesIO()
+            torchaudio.save(output_buffer, combined_waveform, sr1, format="wav")
+            output_buffer.seek(0)
+            
+            return output_buffer.getvalue()
+            
+        except Exception as e:
+            print(f"[DB_AUDIO_ERROR] Failed to combine WAV audio: {e}. Using raw concatenation.")
+            # Fallback to raw concatenation (may cause issues with WAV headers)
+            return existing_audio + new_audio
+
     def store_or_append_audio(self, call_id: str, audio_data: bytes, 
                              audio_type: str) -> str:
         """
-        Store or append audio data for a call
+        Store or append audio data for a call with thread-safe operations
         
         Args:
             call_id: Unique call identifier
@@ -99,36 +150,35 @@ class MongoDB:
         try:
             filename = f"{call_id}_{audio_type}.wav"
             
-            # Check if audio file already exists
-            existing_file = None
-            try:
+            # Thread-safe GridFS operations using lock (GridFS doesn't support transactions)
+            with self._gridfs_lock:
+                # Check if audio file already exists
                 existing_file = self.fs.find_one({"filename": filename})
-            except:
-                pass
-            
-            if existing_file:
-                # Read existing audio data
-                existing_data = existing_file.read()
-                # Concatenate new audio data
-                combined_audio = existing_data + audio_data
-                # Delete old file
-                self.fs.delete(existing_file._id)
-            else:
-                # First audio for this call and type
-                combined_audio = audio_data
-            
-            # Store the combined audio
-            file_id = self.fs.put(
-                combined_audio,
-                filename=filename,
-                metadata={
-                    "call_id": call_id,
-                    "audio_type": audio_type,
-                    "timestamp": datetime.utcnow(),
-                    "content_type": "audio/wav",
-                    "size": len(combined_audio)
-                }
-            )
+                
+                if existing_file:
+                    # Read existing audio data
+                    existing_data = existing_file.read()
+                    # Properly combine WAV audio streams
+                    combined_audio = self._combine_wav_audio(existing_data, audio_data)
+                    # Delete old file
+                    self.fs.delete(existing_file._id)
+                else:
+                    # First audio for this call and type
+                    combined_audio = audio_data
+                
+                # Store the combined audio
+                file_id = self.fs.put(
+                    combined_audio,
+                    filename=filename,
+                    metadata={
+                        "call_id": call_id,
+                        "audio_type": audio_type,
+                        "timestamp": datetime.now(timezone.utc),
+                        "content_type": "audio/wav",
+                        "size": len(combined_audio),
+                        "chunk_count": existing_file.metadata.get("chunk_count", 0) + 1 if existing_file else 1
+                    }
+                )
             
             print(f"[DB] Stored/updated audio: {filename} (ID: {file_id}, Size: {len(combined_audio)} bytes)")
             return str(file_id)
@@ -136,6 +186,133 @@ class MongoDB:
         except Exception as e:
             print(f"[DB ERROR] Failed to store/append audio: {e}")
             raise
+
+    def get_audio_slice(self, call_id: str, audio_type: str, start_time: float, end_time: float = None) -> Optional[bytes]:
+        """
+        Get a slice of audio from the stored audio file
+        
+        Args:
+            call_id: Unique call identifier
+            audio_type: 'agent' or 'client'
+            start_time: Start time in seconds
+            end_time: End time in seconds (None for end of file)
+        
+        Returns:
+            Sliced audio bytes or None if not found
+        """
+        try:
+            import torchaudio
+            from io import BytesIO
+            
+            # Get the full audio file
+            full_audio = self.get_call_audio(call_id, audio_type)
+            if not full_audio:
+                return None
+            
+            # Load audio and slice it
+            buffer = BytesIO(full_audio)
+            waveform, sample_rate = torchaudio.load(buffer)
+            
+            start_frame = int(start_time * sample_rate)
+            end_frame = int(end_time * sample_rate) if end_time is not None else waveform.shape[1]
+            
+            # Ensure slice indices are within bounds
+            start_frame = max(0, start_frame)
+            end_frame = min(waveform.shape[1], end_frame)
+            
+            if start_frame >= end_frame:
+                return None
+                
+            sliced_waveform = waveform[:, start_frame:end_frame]
+            
+            # Convert back to bytes
+            sliced_buffer = BytesIO()
+            torchaudio.save(sliced_buffer, sliced_waveform, sample_rate, format="wav")
+            sliced_buffer.seek(0)
+            
+            return sliced_buffer.getvalue()
+            
+        except Exception as e:
+            print(f"[DB ERROR] Failed to slice audio {call_id}_{audio_type}: {e}")
+            return None
+
+    def store_call_segments(self, call_id: str, audio_type: str, segments: List[Dict]) -> bool:
+        """
+        DEPRECATED: Segments are now stored directly in the call document's conversation array.
+        This method is kept for backward compatibility but does nothing.
+        """
+        # Segments are now stored in the main call document's conversation array
+        # This eliminates the need for separate collections and improves efficiency
+        return True
+
+    def get_call_segments(self, call_id: str, audio_type: str) -> List[Dict]:
+        """
+        DEPRECATED: Segments are now retrieved from the call document's conversation array.
+        This method is kept for backward compatibility.
+        """
+        try:
+            # Get segments from the main call document's conversation array
+            call_doc = self.calls_collection.find_one({"call_id": call_id})
+            if not call_doc:
+                return []
+            
+            conversation = call_doc.get('conversation', [])
+            segments = [entry for entry in conversation if entry.get('speaker') == audio_type]
+            
+            # Convert to expected format
+            formatted_segments = []
+            for segment in segments:
+                formatted_segment = {
+                    'text': segment.get('text', ''),
+                    'start': segment.get('start_time', 0),
+                    'end': segment.get('end_time', 0),
+                    'confidence': segment.get('confidence', 1.0)
+                }
+                formatted_segments.append(formatted_segment)
+            
+            return formatted_segments
+            
+        except Exception as e:
+            return []
+
+    def get_last_segment_time(self, call_id: str, audio_type: str) -> float:
+        """
+        DEPRECATED: Last segment time is now computed from the call document's conversation array.
+        This method is kept for backward compatibility.
+        """
+        try:
+            call_doc = self.calls_collection.find_one({"call_id": call_id})
+            if not call_doc:
+                return 0.0
+            
+            conversation = call_doc.get('conversation', [])
+            speaker_segments = [entry for entry in conversation if entry.get('speaker') == audio_type]
+            
+            if speaker_segments:
+                # Get the last segment by start_time
+                last_segment = max(speaker_segments, key=lambda x: x.get('start_time', 0))
+                return last_segment.get('start_time', 0.0)
+            
+            return 0.0
+            
+        except Exception as e:
+            return 0.0
+
+    def cleanup_call_data(self, call_id: str):
+        """
+        Clean up call-related data including audio files.
+        Segments are now part of the main call document so no separate cleanup needed.
+        """
+        try:
+            # Delete audio files
+            self.delete_call_audio(call_id)
+            
+            # NOTE: Segments are now stored in the main call document's conversation array
+            # so no separate cleanup is needed. This improves efficiency by eliminating
+            # the need to manage multiple collections.
+            
+        except Exception as e:
+            pass
     
     def get_call_audio(self, call_id: str, audio_type: str) -> Optional[bytes]:
         """Retrieve complete audio for a call by type"""
@@ -263,10 +440,13 @@ def create_conversation_entry(speaker: str, text: str, start_time: float,
 def build_conversation_from_segments(agent_segments: List[Dict], 
                                    client_segments: List[Dict]) -> List[Dict]:
     """Build conversation array from separate agent and client segments"""
+    print(f"[DB_DEBUG] build_conversation_from_segments called with {len(agent_segments)} agent segments and {len(client_segments)} client segments")
+    
     conversation = []
     
     # Add agent segments
-    for segment in agent_segments:
+    for i, segment in enumerate(agent_segments):
+        print(f"[DB_DEBUG] Processing agent segment {i}: {segment}")
         conversation.append(create_conversation_entry(
             speaker='agent',
             text=segment.get('text', ''),
@@ -276,7 +456,8 @@ def build_conversation_from_segments(agent_segments: List[Dict],
         ))
     
     # Add client segments
-    for segment in client_segments:
+    for i, segment in enumerate(client_segments):
+        print(f"[DB_DEBUG] Processing client segment {i}: {segment}")
         conversation.append(create_conversation_entry(
             speaker='client',
             text=segment.get('text', ''),
@@ -288,6 +469,7 @@ def build_conversation_from_segments(agent_segments: List[Dict],
     # Sort by start time
     conversation.sort(key=lambda x: x['start_time'])
     
+    print(f"[DB_DEBUG] build_conversation_from_segments completed with {len(conversation)} total entries")
     return conversation
 
 # =============================================================================
