@@ -86,7 +86,7 @@ class CallOperations:
             call = self.calls_collection.find_one({"call_id": call_id})
             if not call:
                 return None
-            
+                
             # Add computed fields for backward compatibility
             call = self._add_computed_fields(call)
             
@@ -180,32 +180,27 @@ class CallOperations:
     def store_audio_and_update_call(self, call_id, client_audio, agent_audio, is_final):
         """Store audio files in GridFS and return file IDs - NOTE: Called within lock context"""
         try:
-            print(f"[DB_DEBUG] Starting store_audio_and_update_call for call_id: {call_id}")
             # NOTE: No lock here as this is called from within store_audio_chunk_and_process which already has the lock
             
             # Store client audio
             client_file_id = None
             if client_audio:
-                print(f"[DB_DEBUG] Storing client audio...")
                 client_audio.seek(0)
                 client_file_id = self.fs.put(
                     client_audio,
                     filename=f"{call_id}_client.wav",
                     metadata={"call_id": call_id, "type": "client", "is_final": is_final}
                 )
-                print(f"[DB_DEBUG] Client audio stored with ID: {client_file_id}")
             
             # Store agent audio
             agent_file_id = None
             if agent_audio:
-                print(f"[DB_DEBUG] Storing agent audio...")
                 agent_audio.seek(0)
                 agent_file_id = self.fs.put(
                     agent_audio,
                     filename=f"{call_id}_agent.wav",
                     metadata={"call_id": call_id, "type": "agent", "is_final": is_final}
                 )
-                print(f"[DB_DEBUG] Agent audio stored with ID: {agent_file_id}")
             
             # Update call with audio file IDs
             update_doc = {"$set": {}}
@@ -214,17 +209,14 @@ class CallOperations:
             if agent_file_id:
                 update_doc["$set"]["audio_metadata.agent_file_id"] = agent_file_id
             
-            print(f"[DB_DEBUG] Updating call document with audio metadata...")
             if update_doc["$set"]:
                 self.calls_collection.update_one({"call_id": call_id}, update_doc)
-                print(f"[DB_DEBUG] Call document updated successfully")
             
             result = {"stored_audio": {"client_id": str(client_file_id), "agent_id": str(agent_file_id)}}
-            print(f"[DB_DEBUG] store_audio_and_update_call completed successfully")
             return result
-                
+            
         except Exception as e:
-            print(f"[DB_DEBUG] ERROR in store_audio_and_update_call: {e}")
+            print(f"[DB_ERROR] store_audio_and_update_call failed: {e}")
             import traceback
             traceback.print_exc()
             return {"stored_audio": {}}
@@ -240,7 +232,7 @@ class CallOperations:
                 agent_segments = transcription.get('agent_segments', [])
                 client_segments = transcription.get('client_segments', [])
                 conversation = build_conversation_from_segments(agent_segments, client_segments)
-            
+                
             # OPTIMIZED: Use atomic operations with efficient chunk numbering
             # This eliminates the need for separate queries and complex aggregation
             current_timestamp = datetime.now(timezone.utc)
@@ -354,79 +346,230 @@ class CallOperations:
     def store_audio_chunk_and_process(self, call_id, client_audio, agent_audio):
         """Store audio chunk and process segments using database-backed approach"""
         try:
-            print(f"[DB_DEBUG] Starting store_audio_chunk_and_process for call_id: {call_id}")
-            print(f"[DB_DEBUG] - Client audio provided: {client_audio is not None}")
-            print(f"[DB_DEBUG] - Agent audio provided: {agent_audio is not None}")
-            
             with self.lock:
-                print(f"[DB_DEBUG] Acquired lock, storing audio chunks")
-                # Store audio chunks in GridFS
-                stored_audio = self.store_audio_and_update_call(call_id, client_audio, agent_audio, False)
-                print(f"[DB_DEBUG] Audio stored: {stored_audio}")
-                
-                print(f"[DB_DEBUG] Getting conversation for call_id: {call_id}")
-                # Get current segments from conversation
+                # Get current segments from conversation BEFORE storing new audio
                 conversation = self.get_conversation(call_id)
                 agent_segments = [entry for entry in conversation if entry.get('speaker') == 'agent']
                 client_segments = [entry for entry in conversation if entry.get('speaker') == 'client']
                 
-                print(f"[DB_DEBUG] Retrieved {len(agent_segments)} agent segments and {len(client_segments)} client segments")
+                print(f"[AUDIO_OVERLAP] Call {call_id}: Found {len(agent_segments)} agent segments, {len(client_segments)} client segments in database")
                 
-                # Calculate overlap times (use last segment end time if available)
+                # Convert database format back to transcription format
+                agent_segments_for_transcription = []
+                for segment in agent_segments:
+                    agent_segments_for_transcription.append({
+                        'text': segment.get('text', ''),
+                        'start': segment.get('start_time', 0),
+                        'end': segment.get('end_time', 0),
+                        'confidence': segment.get('confidence', 1.0)
+                    })
+                
+                client_segments_for_transcription = []
+                for segment in client_segments:
+                    client_segments_for_transcription.append({
+                        'text': segment.get('text', ''),
+                        'start': segment.get('start_time', 0),
+                        'end': segment.get('end_time', 0),
+                        'confidence': segment.get('confidence', 1.0)
+                    })
+                
+                # Calculate overlap times (use last segment START time for proper overlap)
                 agent_overlap_start = 0.0
                 client_overlap_start = 0.0
                 
-                if agent_segments:
-                    agent_overlap_start = agent_segments[-1].get('end_time', 0.0)
-                if client_segments:
-                    client_overlap_start = client_segments[-1].get('end_time', 0.0)
+                if agent_segments_for_transcription:
+                    agent_overlap_start = agent_segments_for_transcription[-1].get('start', 0.0)
+                    print(f"[AUDIO_OVERLAP] Agent: Last segment starts at {agent_overlap_start:.2f}s, will use as overlap start")
+                    print(f"[AUDIO_OVERLAP] Agent: Last segment: {agent_segments_for_transcription[-1].get('start', 0.0):.2f}s-{agent_segments_for_transcription[-1].get('end', 0.0):.2f}s")
+                    print(f"[AUDIO_OVERLAP] Agent: Last segment text: '{agent_segments_for_transcription[-1].get('text', '')[:50]}...'")
+                else:
+                    print(f"[AUDIO_OVERLAP] Agent: No previous segments, starting from 0.0s")
                 
-                print(f"[DB_DEBUG] Overlap times - Agent: {agent_overlap_start}, Client: {client_overlap_start}")
+                if client_segments_for_transcription:
+                    client_overlap_start = client_segments_for_transcription[-1].get('start', 0.0)
+                    print(f"[AUDIO_OVERLAP] Client: Last segment starts at {client_overlap_start:.2f}s, will use as overlap start")
+                    print(f"[AUDIO_OVERLAP] Client: Last segment: {client_segments_for_transcription[-1].get('start', 0.0):.2f}s-{client_segments_for_transcription[-1].get('end', 0.0):.2f}s")
+                    print(f"[AUDIO_OVERLAP] Client: Last segment text: '{client_segments_for_transcription[-1].get('text', '')[:50]}...'")
+                else:
+                    print(f"[AUDIO_OVERLAP] Client: No previous segments, starting from 0.0s")
                 
-                # Prepare audio for transcription (read the audio data)
+                # Get overlap audio slices BEFORE storing current chunk
                 agent_audio_for_transcription = None
                 client_audio_for_transcription = None
                 
                 if agent_audio:
-                    print(f"[DB_DEBUG] Reading agent audio data")
+                    print(f"[AUDIO_SLICE] Agent: Processing audio chunk of {len(agent_audio.read())} bytes")
                     agent_audio.seek(0)
-                    agent_audio_for_transcription = agent_audio.read()
-                    agent_audio.seek(0)
-                    print(f"[DB_DEBUG] Agent audio size: {len(agent_audio_for_transcription) if agent_audio_for_transcription else 0} bytes")
+                    
+                    # Get the full stored agent audio (before adding current chunk)
+                    full_agent_audio = self.db.get_call_audio(call_id, 'agent')
+                    if full_agent_audio and agent_overlap_start > 0:
+                        print(f"[AUDIO_SLICE] Agent: Full stored audio is {len(full_agent_audio)} bytes")
+                        
+                        # Calculate stored audio duration
+                        import torchaudio
+                        from io import BytesIO
+                        buffer = BytesIO(full_agent_audio)
+                        waveform, sample_rate = torchaudio.load(buffer)
+                        stored_duration = waveform.shape[1] / sample_rate
+                        print(f"[AUDIO_SLICE] Agent: Stored audio duration: {stored_duration:.2f}s")
+                        
+                        # Calculate the total duration of all segments so far
+                        total_segments_duration = 0.0
+                        if agent_segments_for_transcription:
+                            total_segments_duration = agent_segments_for_transcription[-1].get('end', 0.0)
+                        
+                        print(f"[AUDIO_SLICE] Agent: Total segments duration: {total_segments_duration:.2f}s")
+                        print(f"[AUDIO_SLICE] Agent: Last segment starts at: {agent_overlap_start:.2f}s")
+                        
+                        # Calculate how much audio to slice from the end of stored audio
+                        # We want audio from the last segment start to the end of stored audio
+                        if total_segments_duration > 0 and agent_overlap_start >= 0:
+                            # Calculate how much audio we need from the stored audio
+                            audio_needed_duration = total_segments_duration - agent_overlap_start
+                            print(f"[AUDIO_SLICE] Agent: Audio needed from last segment: {audio_needed_duration:.2f}s")
+                            
+                            # Calculate start time within stored audio (from the end backwards)
+                            relative_start = max(0.0, stored_duration - audio_needed_duration)
+                            print(f"[AUDIO_SLICE] Agent: Calculated relative start: {relative_start:.2f}s within stored audio")
+                        else:
+                            # Fallback: use entire stored audio
+                            relative_start = 0.0
+                            print(f"[AUDIO_SLICE] Agent: Using entire stored audio as fallback")
+                        
+                        print(f"[AUDIO_SLICE] Agent: Requesting overlap slice from {relative_start:.2f}s to end of stored audio")
+                        
+                        # Get overlap audio slice using relative time
+                        overlap_slice = self.db.get_audio_slice(call_id, 'agent', relative_start)
+                        if overlap_slice:
+                            print(f"[AUDIO_SLICE] Agent: Overlap slice is {len(overlap_slice)} bytes")
+                            
+                            # Combine overlap slice + current chunk
+                            agent_audio.seek(0)
+                            current_chunk = agent_audio.read()
+                            agent_audio.seek(0)
+                            
+                            # Combine audio using database method
+                            combined_audio = self.db._combine_wav_audio(overlap_slice, current_chunk)
+                            agent_audio_for_transcription = combined_audio
+                            print(f"[AUDIO_SLICE] Agent: Combined overlap ({len(overlap_slice)} bytes) + current chunk ({len(current_chunk)} bytes) = {len(combined_audio)} bytes")
+                        else:
+                            print(f"[AUDIO_SLICE] Agent: Overlap slice failed, using current chunk only")
+                            agent_audio.seek(0)
+                            agent_audio_for_transcription = agent_audio.read()
+                            agent_audio.seek(0)
+                            print(f"[AUDIO_SLICE] Agent: Using current chunk only: {len(agent_audio_for_transcription)} bytes")
+                    else:
+                        print(f"[AUDIO_SLICE] Agent: No previous audio stored or no overlap needed, using current chunk only")
+                        # No previous audio, use current chunk
+                        agent_audio.seek(0)
+                        agent_audio_for_transcription = agent_audio.read()
+                        agent_audio.seek(0)
+                        print(f"[AUDIO_SLICE] Agent: Current chunk only: {len(agent_audio_for_transcription)} bytes")
                 
                 if client_audio:
-                    print(f"[DB_DEBUG] Reading client audio data")
+                    print(f"[AUDIO_SLICE] Client: Processing audio chunk of {len(client_audio.read())} bytes")
                     client_audio.seek(0)
-                    client_audio_for_transcription = client_audio.read()
-                    client_audio.seek(0)
-                    print(f"[DB_DEBUG] Client audio size: {len(client_audio_for_transcription) if client_audio_for_transcription else 0} bytes")
+                    
+                    # Get the full stored client audio (before adding current chunk)
+                    full_client_audio = self.db.get_call_audio(call_id, 'client')
+                    if full_client_audio and client_overlap_start > 0:
+                        print(f"[AUDIO_SLICE] Client: Full stored audio is {len(full_client_audio)} bytes")
+                        
+                        # Calculate stored audio duration
+                        import torchaudio
+                        from io import BytesIO
+                        buffer = BytesIO(full_client_audio)
+                        waveform, sample_rate = torchaudio.load(buffer)
+                        stored_duration = waveform.shape[1] / sample_rate
+                        print(f"[AUDIO_SLICE] Client: Stored audio duration: {stored_duration:.2f}s")
+                        
+                        # Calculate the total duration of all segments so far
+                        total_segments_duration = 0.0
+                        if client_segments_for_transcription:
+                            total_segments_duration = client_segments_for_transcription[-1].get('end', 0.0)
+                        
+                        print(f"[AUDIO_SLICE] Client: Total segments duration: {total_segments_duration:.2f}s")
+                        print(f"[AUDIO_SLICE] Client: Last segment starts at: {client_overlap_start:.2f}s")
+                        
+                        # Calculate how much audio to slice from the end of stored audio
+                        # We want audio from the last segment start to the end of stored audio
+                        if total_segments_duration > 0 and client_overlap_start >= 0:
+                            # Calculate how much audio we need from the stored audio
+                            audio_needed_duration = total_segments_duration - client_overlap_start
+                            print(f"[AUDIO_SLICE] Client: Audio needed from last segment: {audio_needed_duration:.2f}s")
+                            
+                            # Calculate start time within stored audio (from the end backwards)
+                            relative_start = max(0.0, stored_duration - audio_needed_duration)
+                            print(f"[AUDIO_SLICE] Client: Calculated relative start: {relative_start:.2f}s within stored audio")
+                        else:
+                            # Fallback: use entire stored audio
+                            relative_start = 0.0
+                            print(f"[AUDIO_SLICE] Client: Using entire stored audio as fallback")
+                        
+                        print(f"[AUDIO_SLICE] Client: Requesting overlap slice from {relative_start:.2f}s to end of stored audio")
+                        
+                        # Get overlap audio slice using relative time
+                        overlap_slice = self.db.get_audio_slice(call_id, 'client', relative_start)
+                        if overlap_slice:
+                            print(f"[AUDIO_SLICE] Client: Overlap slice is {len(overlap_slice)} bytes")
+                            
+                            # Combine overlap slice + current chunk
+                            client_audio.seek(0)
+                            current_chunk = client_audio.read()
+                            client_audio.seek(0)
+                            
+                            # Combine audio using database method
+                            combined_audio = self.db._combine_wav_audio(overlap_slice, current_chunk)
+                            client_audio_for_transcription = combined_audio
+                            print(f"[AUDIO_SLICE] Client: Combined overlap ({len(overlap_slice)} bytes) + current chunk ({len(current_chunk)} bytes) = {len(combined_audio)} bytes")
+                        else:
+                            print(f"[AUDIO_SLICE] Client: Overlap slice failed, using current chunk only")
+                            client_audio.seek(0)
+                            client_audio_for_transcription = client_audio.read()
+                            client_audio.seek(0)
+                            print(f"[AUDIO_SLICE] Client: Using current chunk only: {len(client_audio_for_transcription)} bytes")
+                    else:
+                        print(f"[AUDIO_SLICE] Client: No previous audio stored or no overlap needed, using current chunk only")
+                        # No previous audio, use current chunk
+                        client_audio.seek(0)
+                        client_audio_for_transcription = client_audio.read()
+                        client_audio.seek(0)
+                        print(f"[AUDIO_SLICE] Client: Current chunk only: {len(client_audio_for_transcription)} bytes")
+                
+                print(f"[AUDIO_OVERLAP] Final audio sizes - Agent: {len(agent_audio_for_transcription) if agent_audio_for_transcription else 0} bytes, Client: {len(client_audio_for_transcription) if client_audio_for_transcription else 0} bytes")
+                
+                # Log what time range we're sending to Whisper
+                if agent_audio_for_transcription:
+                    # Estimate duration from audio size (rough approximation)
+                    estimated_duration = len(agent_audio_for_transcription) / 44100 / 2  # 44.1kHz, 16-bit
+                    print(f"[WHISPER_AUDIO] Agent: Sending audio from {agent_overlap_start:.2f}s, estimated duration: {estimated_duration:.2f}s")
+                    print(f"[WHISPER_AUDIO] Agent: Audio should contain last segment + current chunk")
+                
+                if client_audio_for_transcription:
+                    estimated_duration = len(client_audio_for_transcription) / 44100 / 2
+                    print(f"[WHISPER_AUDIO] Client: Sending audio from {client_overlap_start:.2f}s, estimated duration: {estimated_duration:.2f}s")
+                    print(f"[WHISPER_AUDIO] Client: Audio should contain last segment + current chunk")
+                
+                # Store audio chunks in GridFS AFTER processing overlap
+                stored_audio = self.store_audio_and_update_call(call_id, client_audio, agent_audio, False)
                 
                 result = {
                     "stored_audio": stored_audio.get("stored_audio", {}),
-                    "agent_segments": agent_segments,
-                    "client_segments": client_segments,
+                    "agent_segments": agent_segments_for_transcription,
+                    "client_segments": client_segments_for_transcription,
                     "agent_overlap_start": agent_overlap_start,
                     "client_overlap_start": client_overlap_start,
                     "agent_audio_for_transcription": agent_audio_for_transcription,
                     "client_audio_for_transcription": client_audio_for_transcription
                 }
                 
-                print(f"[DB_DEBUG] store_audio_chunk_and_process completed successfully")
                 return result
                 
         except Exception as e:
-            print(f"[DB_DEBUG] ERROR in store_audio_chunk_and_process: {e}")
+            print(f"[DB_ERROR] store_audio_chunk_and_process failed: {e}")
             import traceback
             traceback.print_exc()
-            return {
-                "stored_audio": {},
-                "agent_segments": [],
-                "client_segments": [],
-                "agent_overlap_start": 0.0,
-                "client_overlap_start": 0.0,
-                "agent_audio_for_transcription": None,
-                "client_audio_for_transcription": None
-            }
 
     def update_call_segments(self, call_id, agent_segments=None, client_segments=None):
         """Update call segments in the conversation array"""
@@ -496,8 +639,31 @@ class CallOperations:
             
             # Get segments from conversation
             conversation = call.get('conversation', [])
-            agent_segments = [entry for entry in conversation if entry.get('speaker') == 'agent']
-            client_segments = [entry for entry in conversation if entry.get('speaker') == 'client']
+            agent_segments_db = [entry for entry in conversation if entry.get('speaker') == 'agent']
+            client_segments_db = [entry for entry in conversation if entry.get('speaker') == 'client']
+            
+            print(f"[FINAL_SEGMENTS] Retrieved {len(agent_segments_db)} agent segments and {len(client_segments_db)} client segments from database")
+            
+            # Convert database format to transcription format for final processing
+            agent_segments = []
+            for segment in agent_segments_db:
+                agent_segments.append({
+                    'text': segment.get('text', ''),
+                    'start': segment.get('start_time', 0),
+                    'end': segment.get('end_time', 0),
+                    'confidence': segment.get('confidence', 1.0)
+                })
+                print(f"[FINAL_SEGMENTS] Agent segment: {segment.get('start_time', 0):.2f}s-{segment.get('end_time', 0):.2f}s: '{segment.get('text', '')[:40]}...'")
+            
+            client_segments = []
+            for segment in client_segments_db:
+                client_segments.append({
+                    'text': segment.get('text', ''),
+                    'start': segment.get('start_time', 0),
+                    'end': segment.get('end_time', 0),
+                    'confidence': segment.get('confidence', 1.0)
+                })
+                print(f"[FINAL_SEGMENTS] Client segment: {segment.get('start_time', 0):.2f}s-{segment.get('end_time', 0):.2f}s: '{segment.get('text', '')[:40]}...'")
             
             return {
                 "client_audio": client_audio,
@@ -507,6 +673,9 @@ class CallOperations:
             }
             
         except Exception as e:
+            print(f"[DB_ERROR] get_full_call_audio_and_segments failed: {e}")
+            import traceback
+            traceback.print_exc()
             return {}
 
     def cleanup_call_resources(self, call_id):

@@ -36,7 +36,20 @@ def merge_transcription_segments(previous_segments, new_segments, overlap_start_
     Returns:
         list: The final, merged list of segments.
     """
+    print(f"[MERGE_SEGMENTS] Starting merge with {len(previous_segments)} previous segments, {len(new_segments)} new segments, overlap_start_time: {overlap_start_time:.2f}s")
+    
+    if previous_segments:
+        print(f"[MERGE_SEGMENTS] Previous segments timeline:")
+        for i, seg in enumerate(previous_segments):
+            print(f"[MERGE_SEGMENTS]   {i+1}. {seg.get('start', 0):.2f}s-{seg.get('end', 0):.2f}s: '{seg.get('text', '')[:40]}...'")
+    
+    if new_segments:
+        print(f"[MERGE_SEGMENTS] New segments timeline (before adjustment):")
+        for i, seg in enumerate(new_segments):
+            print(f"[MERGE_SEGMENTS]   {i+1}. {seg.get('start', 0):.2f}s-{seg.get('end', 0):.2f}s: '{seg.get('text', '')[:40]}...'")
+    
     if not previous_segments:
+        print(f"[MERGE_SEGMENTS] No previous segments, returning new segments as-is")
         return new_segments
 
     # Find the index of the last segment in the previous list that should be replaced.
@@ -50,20 +63,31 @@ def merge_transcription_segments(previous_segments, new_segments, overlap_start_
     # If no segment was found to replace (e.g., silence), just append.
     if first_segment_to_replace_index == -1:
         base_segments = previous_segments
+        print(f"[MERGE_SEGMENTS] No segments found at or after overlap point, keeping all {len(base_segments)} previous segments")
     else:
         base_segments = previous_segments[:first_segment_to_replace_index]
+        removed_count = len(previous_segments) - first_segment_to_replace_index
+        print(f"[MERGE_SEGMENTS] Removing {removed_count} segments starting from index {first_segment_to_replace_index}, keeping {len(base_segments)} base segments")
 
     # The new segments' timestamps are relative to the start of the audio sent to Whisper.
     # We need to adjust them to be absolute timestamps in the context of the full call.
     adjusted_new_segments = []
-    for segment in new_segments:
+    print(f"[MERGE_SEGMENTS] Adjusting new segment timestamps by adding {overlap_start_time:.2f}s:")
+    for i, segment in enumerate(new_segments):
         adjusted_segment = segment.copy()
+        original_start = segment['start']
+        original_end = segment['end']
         adjusted_segment['start'] = round(overlap_start_time + segment['start'], 4)
         adjusted_segment['end'] = round(overlap_start_time + segment['end'], 4)
         adjusted_new_segments.append(adjusted_segment)
+        print(f"[MERGE_SEGMENTS]   {i+1}. {original_start:.2f}s-{original_end:.2f}s → {adjusted_segment['start']:.2f}s-{adjusted_segment['end']:.2f}s: '{segment.get('text', '')[:40]}...'")
 
     # Combine the base segments with the newly transcribed and adjusted ones
     final_segments = base_segments + adjusted_new_segments
+    
+    print(f"[MERGE_SEGMENTS] Final merged timeline ({len(final_segments)} total segments):")
+    for i, seg in enumerate(final_segments):
+        print(f"[MERGE_SEGMENTS]   {i+1}. {seg.get('start', 0):.2f}s-{seg.get('end', 0):.2f}s: '{seg.get('text', '')[:40]}...'")
 
     print(f"[MERGE_SEGMENTS] Merged {len(base_segments)} base segments with {len(adjusted_new_segments)} new segments. Total: {len(final_segments)}")
     return final_segments

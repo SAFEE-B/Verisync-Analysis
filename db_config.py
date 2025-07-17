@@ -180,7 +180,6 @@ class MongoDB:
                     }
                 )
             
-            print(f"[DB] Stored/updated audio: {filename} (ID: {file_id}, Size: {len(combined_audio)} bytes)")
             return str(file_id)
             
         except Exception as e:
@@ -204,36 +203,59 @@ class MongoDB:
             import torchaudio
             from io import BytesIO
             
+            print(f"[AUDIO_SLICE_DEBUG] Attempting to slice {call_id}_{audio_type} from {start_time:.2f}s to {end_time or 'end'}")
+            
             # Get the full audio file
             full_audio = self.get_call_audio(call_id, audio_type)
             if not full_audio:
+                print(f"[AUDIO_SLICE_DEBUG] No audio found for {call_id}_{audio_type}")
                 return None
+            
+            print(f"[AUDIO_SLICE_DEBUG] Full audio size: {len(full_audio)} bytes")
             
             # Load audio and slice it
             buffer = BytesIO(full_audio)
             waveform, sample_rate = torchaudio.load(buffer)
             
+            print(f"[AUDIO_SLICE_DEBUG] Audio loaded: {waveform.shape[1]} frames, {sample_rate} Hz")
+            print(f"[AUDIO_SLICE_DEBUG] Audio duration: {waveform.shape[1] / sample_rate:.2f} seconds")
+            
             start_frame = int(start_time * sample_rate)
             end_frame = int(end_time * sample_rate) if end_time is not None else waveform.shape[1]
             
+            print(f"[AUDIO_SLICE_DEBUG] Slice frames: {start_frame} to {end_frame}")
+            print(f"[AUDIO_SLICE_DEBUG] Slice duration: {(end_frame - start_frame) / sample_rate:.2f} seconds")
+            
             # Ensure slice indices are within bounds
+            original_start = start_frame
+            original_end = end_frame
             start_frame = max(0, start_frame)
             end_frame = min(waveform.shape[1], end_frame)
             
+            if original_start != start_frame or original_end != end_frame:
+                print(f"[AUDIO_SLICE_DEBUG] Adjusted slice bounds: {start_frame} to {end_frame}")
+            
             if start_frame >= end_frame:
+                print(f"[AUDIO_SLICE_DEBUG] Invalid slice: start_frame ({start_frame}) >= end_frame ({end_frame})")
                 return None
                 
             sliced_waveform = waveform[:, start_frame:end_frame]
+            print(f"[AUDIO_SLICE_DEBUG] Sliced waveform shape: {sliced_waveform.shape}")
             
             # Convert back to bytes
             sliced_buffer = BytesIO()
             torchaudio.save(sliced_buffer, sliced_waveform, sample_rate, format="wav")
             sliced_buffer.seek(0)
             
-            return sliced_buffer.getvalue()
+            result = sliced_buffer.getvalue()
+            print(f"[AUDIO_SLICE_DEBUG] Slice result: {len(result)} bytes")
+            
+            return result
             
         except Exception as e:
-            print(f"[DB ERROR] Failed to slice audio {call_id}_{audio_type}: {e}")
+            print(f"[AUDIO_SLICE_ERROR] Failed to slice audio {call_id}_{audio_type}: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def store_call_segments(self, call_id: str, audio_type: str, segments: List[Dict]) -> bool:
@@ -357,10 +379,6 @@ class MongoDB:
                 if file_info:
                     self.fs.delete(file_info._id)
                     deleted_count += 1
-                    print(f"[DB] Deleted audio file: {filename}")
-            
-            if deleted_count > 0:
-                print(f"[DB] Deleted {deleted_count} audio files for call {call_id}")
             
         except Exception as e:
             print(f"[DB ERROR] Failed to delete audio files for call {call_id}: {e}")
@@ -440,13 +458,10 @@ def create_conversation_entry(speaker: str, text: str, start_time: float,
 def build_conversation_from_segments(agent_segments: List[Dict], 
                                    client_segments: List[Dict]) -> List[Dict]:
     """Build conversation array from separate agent and client segments"""
-    print(f"[DB_DEBUG] build_conversation_from_segments called with {len(agent_segments)} agent segments and {len(client_segments)} client segments")
-    
     conversation = []
     
     # Add agent segments
     for i, segment in enumerate(agent_segments):
-        print(f"[DB_DEBUG] Processing agent segment {i}: {segment}")
         conversation.append(create_conversation_entry(
             speaker='agent',
             text=segment.get('text', ''),
@@ -457,7 +472,6 @@ def build_conversation_from_segments(agent_segments: List[Dict],
     
     # Add client segments
     for i, segment in enumerate(client_segments):
-        print(f"[DB_DEBUG] Processing client segment {i}: {segment}")
         conversation.append(create_conversation_entry(
             speaker='client',
             text=segment.get('text', ''),
@@ -469,7 +483,6 @@ def build_conversation_from_segments(agent_segments: List[Dict],
     # Sort by start time
     conversation.sort(key=lambda x: x['start_time'])
     
-    print(f"[DB_DEBUG] build_conversation_from_segments completed with {len(conversation)} total entries")
     return conversation
 
 # =============================================================================

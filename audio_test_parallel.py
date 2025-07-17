@@ -24,7 +24,7 @@ def run_single_call(call_index, args, custom_script=None):
     success = tester.run_test(
         args.audio_file,
         call_id=call_id,
-        custom_script=custom_script,
+        transcript_content=custom_script,
         test_mode=args.test_mode,
         agent_id=f"agent_{call_index}",
         customer_id=f"customer_{call_index}"

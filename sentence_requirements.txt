@@ -1,5 +1,0 @@
-python-dotenv==1.0.0
-groq==0.4.2
-numpy>=1.21.0
-rapidfuzz>=3.0.0
-nltk>=3.8 
