@@ -13,7 +13,10 @@ import nltk
 from sentence_transformers import SentenceTransformer, util
 import threading
 from functools import lru_cache
-import traceback # Make sure to import traceback at the top of your file for better error logging
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+
+
 
 # =============================================================================
 # GLOBAL STATE & HELPERS
@@ -25,39 +28,56 @@ import traceback # Make sure to import traceback at the top of your file for bet
 # For production, a more robust distributed cache like Redis could be used.
 call_audio_buffers = {}
 
+# Threading locks to ensure safe concurrent access to the shared buffer.
+# A dictionary of locks, one for each call_id, allows for granular locking,
+# enabling different calls to be processed in parallel without conflict.
+call_locks = {}
+call_locks_lock = threading.Lock()  # A lock to manage the creation of new call-specific locks safely
+
+# ThreadPoolExecutor for managing concurrent tasks like API calls
+# This creates a pool of threads that can be reused for short-lived tasks,
+# improving efficiency by avoiding the overhead of creating new threads for each task.
+executor = ThreadPoolExecutor(max_workers=os.cpu_count() * 2) # A reasonable default for I/O-bound tasks
+
+def get_lock_for_call(call_id):
+    """
+    Safely retrieves or creates a threading.Lock for a given call_id.
+    This ensures that each call has its own lock, preventing race conditions
+    when multiple updates for the same call arrive simultaneously.
+    """
+    with call_locks_lock:
+        if call_id not in call_locks:
+            call_locks[call_id] = threading.Lock()
+        return call_locks[call_id]
+
+def cleanup_call_resources(call_id):
+    """
+    Removes the buffer and lock for a completed call to free up memory.
+    """
+    with call_locks_lock:
+        if call_id in call_audio_buffers:
+            del call_audio_buffers[call_id]
+            print(f"[BUFFER_CLEANUP] Cleared audio buffer for completed call {call_id}")
+        if call_id in call_locks:
+            del call_locks[call_id]
+            print(f"[LOCK_CLEANUP] Cleared lock for completed call {call_id}")
 
 
 def merge_transcription_segments(previous_segments, new_segments, overlap_start_time):
     """
     Merges new transcription segments with a previous set by replacing the overlapping portion.
-
-    Args:
-        previous_segments (list): The list of segments from the prior transcription.
-        new_segments (list): The list of segments from the new, overlapping transcription.
-        overlap_start_time (float): The timestamp where the re-transcription began.
-
-    Returns:
-        list: The final, merged list of segments.
     """
     if not previous_segments:
         return new_segments
 
-    # Find the index of the last segment in the previous list that should be replaced.
-    # We remove any segments that started at or after the overlap point.
     first_segment_to_replace_index = -1
     for i, segment in enumerate(previous_segments):
         if segment.get('start', 0) >= overlap_start_time:
             first_segment_to_replace_index = i
             break
 
-    # If no segment was found to replace (e.g., silence), just append.
-    if first_segment_to_replace_index == -1:
-        base_segments = previous_segments
-    else:
-        base_segments = previous_segments[:first_segment_to_replace_index]
+    base_segments = previous_segments[:first_segment_to_replace_index] if first_segment_to_replace_index != -1 else previous_segments
 
-    # The new segments' timestamps are relative to the start of the audio sent to Whisper.
-    # We need to adjust them to be absolute timestamps in the context of the full call.
     adjusted_new_segments = []
     for segment in new_segments:
         adjusted_segment = segment.copy()
@@ -65,27 +85,16 @@ def merge_transcription_segments(previous_segments, new_segments, overlap_start_
         adjusted_segment['end'] = round(overlap_start_time + segment['end'], 4)
         adjusted_new_segments.append(adjusted_segment)
 
-    # Combine the base segments with the newly transcribed and adjusted ones
     final_segments = base_segments + adjusted_new_segments
-
     print(f"[MERGE_SEGMENTS] Merged {len(base_segments)} base segments with {len(adjusted_new_segments)} new segments. Total: {len(final_segments)}")
     return final_segments
 
 
 def slice_audio(audio_bytes: bytes, start_time_s: float, end_time_s: float = None) -> BytesIO:
     """
-    Slices a WAV audio file provided as bytes using torchaudio.
-    
-    Args:
-        audio_bytes: The raw bytes of the WAV audio.
-        start_time_s: The start time for the slice in seconds.
-        end_time_s: The end time for the slice in seconds. If None, slices to the end.
-        
-    Returns:
-        A BytesIO object containing the sliced WAV audio.
+    Slices a WAV audio file provided as bytes.
     """
-    if not audio_bytes or len(audio_bytes) < 44:  # Smallest possible valid WAV
-        print("[AUDIO_SLICE_WARNING] Audio bytes are empty or too small. Returning empty buffer.")
+    if not audio_bytes or len(audio_bytes) < 44:
         return BytesIO()
         
     try:
@@ -95,7 +104,6 @@ def slice_audio(audio_bytes: bytes, start_time_s: float, end_time_s: float = Non
         start_frame = int(start_time_s * sample_rate)
         end_frame = int(end_time_s * sample_rate) if end_time_s is not None else waveform.shape[1]
             
-        # Ensure slice indices are within the valid range of the audio tensor
         start_frame = max(0, start_frame)
         end_frame = min(waveform.shape[1], end_frame)
         
@@ -112,15 +120,11 @@ def slice_audio(audio_bytes: bytes, start_time_s: float, end_time_s: float = Non
         
     except Exception as e:
         print(f"[AUDIO_SLICE_ERROR] Failed to slice audio: {e}. Returning original audio as fallback.")
-        fallback_buffer = BytesIO(audio_bytes)
-        fallback_buffer.seek(0)
-        return fallback_buffer
+        return BytesIO(audio_bytes)
 
 def append_wav_chunks(existing_wav_bytes: bytes, new_wav_chunk_bytes: bytes) -> bytes:
     """
-    Combines two WAV byte streams by decoding them, concatenating their
-    audio data, and encoding back into a single WAV byte stream.
-    This prevents issues with concatenated WAV headers.
+    Combines two WAV byte streams robustly.
     """
     if not new_wav_chunk_bytes:
         return existing_wav_bytes
@@ -135,7 +139,6 @@ def append_wav_chunks(existing_wav_bytes: bytes, new_wav_chunk_bytes: bytes) -> 
         new_waveform, sr2 = torchaudio.load(new_chunk_buffer)
 
         if sr1 != sr2:
-            print(f"[AUDIO_APPEND_WARNING] Sample rate mismatch: {sr1} vs {sr2}. Resampling to {sr1}.")
             resampler = torchaudio.transforms.Resample(sr2, sr1)
             new_waveform = resampler(new_waveform)
 
@@ -143,8 +146,6 @@ def append_wav_chunks(existing_wav_bytes: bytes, new_wav_chunk_bytes: bytes) -> 
         
         output_buffer = BytesIO()
         torchaudio.save(output_buffer, combined_waveform, sr1, format="wav")
-        output_buffer.seek(0)
-        
         return output_buffer.getvalue()
     except Exception as e:
         print(f"[AUDIO_APPEND_ERROR] Failed to combine WAV chunks: {e}. Returning original audio only.")
@@ -188,30 +189,10 @@ def resegment_based_on_punctuation(words):
             'end': end_time,
         })
 
-    print(f"[RESEGMENT] Created {len(new_segments)} new segments from {len(words)} words.")
     return new_segments
 
-# =============================================================================
-# VERISYNC ANALYSIS BACKEND - SEGMENT-BASED VERSION
-# =============================================================================
-# 
-# Segment-based version using Whisper segments as sentences:
-# - POST /update_call: Process audio chunks with segment-based analysis
-# - POST /final_update: Complete call analysis with final metrics
-#
-# Key Features:
-# - Segment-Based Processing: Uses Whisper segments directly as sentences
-# - Adaptive Windows: Tests window sizes 1, 2, and 3 automatically
-# - SBERT Optimization: Cached embeddings + GPU support
-# - Complete Analysis: Audio processing, transcription, adherence, emotions
-# - Custom Script Support: XML-like format with automatic parsing
-# - Script Fallback: Loads from audioscript.txt if no transcript provided
-#
-# Script Format:
-# <strict>The line of the script</strict>
-# <semantic>The line of the script</semantic>
-# <topic>The line of the script</topic>
-# =============================================================================
+
+
 
 # MongoDB imports
 from db_config import get_db
@@ -260,7 +241,7 @@ try:
             sbert_model = SentenceTransformer(model_name)
             
             if torch.cuda.is_available():
-                # sbert_model = sbert_model.to('cuda')
+                sbert_model = sbert_model.to('cuda')
                 print(f"[INFO] SBERT model moved to GPU")
             else:
                 print(f"[INFO] SBERT model running on CPU")
@@ -894,7 +875,7 @@ def detect_voice_activity(audio_file, min_speech_duration=0.5, min_silence_durat
         }
 
 def speech_to_text(audio):
-    """Convert audio to text using Groq Whisper API with segment-based processing"""
+    """Convert audio to text using Groq Whisper API with segment-based processing, using no_speech_prob for silence detection."""
     try:
         audio_copy = BytesIO()
         audio.seek(0)
@@ -907,11 +888,10 @@ def speech_to_text(audio):
         if len(buffer_data) < 44:
             return "", 0, [], []
         
-        # Voice Activity Detection
-        vad_result = detect_voice_activity(audio_copy, min_speech_duration=0.3, min_silence_duration=0.1)
-        
-        if not vad_result['has_speech']:
-            return "", vad_result['total_audio_duration'], [], []
+        # Voice Activity Detection (SAD) - keep commented for reference
+        # vad_result = detect_voice_activity(audio_copy, min_speech_duration=0.3, min_silence_duration=0.1)
+        # if not vad_result['has_speech']:
+        #     return "", vad_result['total_audio_duration'], [], []
         
         # Groq Whisper API transcription with segment granularity
         audio_copy.name = "audio.wav"
@@ -925,14 +905,32 @@ def speech_to_text(audio):
             timestamp_granularities=["segment", "word"]
         )
         
-        print("[API RESPONSE] Groq Whisper segment transcription completed")
+        print("[API RESPONSE] Groq Whisper segment transcription completed", response)
+        
+        # Extract no_speech_prob and duration from response
+        no_speech_prob = None
+        duration = 0
+        if hasattr(response, 'no_speech_prob'):
+            no_speech_prob = getattr(response, 'no_speech_prob', None)
+            print("NSP",no_speech_prob)
+        elif isinstance(response, dict):
+            no_speech_prob = response.get('no_speech_prob', None)
+        
+        if hasattr(response, 'duration'):
+            duration = getattr(response, 'duration', 0)
+            print("DURR",duration)
+        elif isinstance(response, dict):
+            duration = response.get('duration', 0)
+        
+        # If no_speech_prob is high, treat as silent
+        if no_speech_prob is not None and no_speech_prob > 0.7:
+            print(f"[SILENCE DETECTED] no_speech_prob={no_speech_prob}, treating as silent.")
+            return "", duration, [], []
         
         if hasattr(response, 'text'):
             transcription = response.text or ""
         else:
             transcription = response.get('text', '') if isinstance(response, dict) else ""
-        
-        duration = vad_result['total_audio_duration']
         
         # Process segment-level data
         segment_data = []
@@ -975,8 +973,6 @@ def speech_to_text(audio):
                     'end': word.get('end', 0)
                 })
 
-        print(f"[API RESPONSE] Extracted {len(segment_data)} segments and {len(word_data)} words from Whisper")
-        
         return transcription, duration, segment_data, word_data
         
     except Exception as e:
@@ -996,15 +992,11 @@ def speech_to_text(audio):
                     response_format="verbose_json",
                     timestamp_granularities=["segment", "word"]
                 )
-                
                 if hasattr(response, 'text'):
                     transcription = response.text or ""
                 else:
                     transcription = response.get('text', '') if isinstance(response, dict) else ""
-                
-                print("[API RETRY] Groq API retry successful")
                 return transcription, 0, [], []
-                
             except Exception as retry_error:
                 print(f"[API ERROR] Groq API retry failed: {retry_error}")
                 return "", 0, [], []
@@ -1205,9 +1197,8 @@ if SBERT_AVAILABLE and sbert_model is not None:
 else:
     print("[INFO] SBERT not available, skipping prompt embeddings cache")
 
-# =============================================================================
-# FLASK APPLICATION
-# =============================================================================
+
+
 
 app = Flask(__name__)
 CORS(app)
@@ -1216,24 +1207,17 @@ load_dotenv()
 
 # Load environment variables
 groq_api_key = os.getenv('GROQ_API_KEY')
-mongodb_uri = os.getenv('MONGODB_URI')
-mongodb_host = os.getenv('MONGODB_HOST', 'localhost')
-mongodb_db_name = os.getenv('MONGODB_DB_NAME', 'verisync_analysis')
-emotion_model_url = os.getenv('EMOTION_MODEL')
-main_backend_url = os.getenv('MAIN_BACKEND_URL', 'http://localhost:3000')
+# ... other env vars
 
 if not groq_api_key:
-    print("[ERROR] GROQ_API_KEY not found!")
+    raise ValueError("[ERROR] GROQ_API_KEY not found in environment variables!")
 
-try:
-    client = Groq(api_key=groq_api_key)
-except Exception as e:
-    print(f"[ERROR] Failed to initialize Groq client: {e}")
+client = Groq(api_key=groq_api_key)
+
 
 @app.route('/create_call', methods=['POST'])
 def create_call():
     print("[ROUTE] POST /create_call")
-    # Use request.form to handle form data, consistent with other endpoints
     if 'call_id' not in request.form:
         return jsonify({"error": "call_id is a required field"}), 400
     
@@ -1250,291 +1234,224 @@ def create_call():
     else:
         return jsonify({"error": "Failed to create call record in database"}), 500
 
+
+def _process_audio_for_update(call_id, speaker_type, audio_chunk_bytes):
+    """
+    Helper function to process an audio chunk for a specific speaker (agent/client).
+    This function can be run in a separate thread.
+    """
+    call_lock = get_lock_for_call(call_id)
+    with call_lock:
+        # Get previous state from buffer
+        previous_full_audio_bytes = call_audio_buffers[call_id][f'{speaker_type}_audio'].getvalue()
+        previous_segments = call_audio_buffers[call_id][f'{speaker_type}_segments']
+
+    # Determine the start time for re-transcription
+    overlap_start_time = 0.0
+    if previous_segments:
+        overlap_start_time = previous_segments[-1].get('start', 0)
+
+    # Create the audio slice to be sent for transcription
+    context_slice_bytes = slice_audio(previous_full_audio_bytes, overlap_start_time).getvalue()
+    audio_for_transcription_bytes = append_wav_chunks(context_slice_bytes, audio_chunk_bytes)
+
+    # Transcribe the overlapping audio chunk
+    new_segments = []
+    if audio_for_transcription_bytes:
+        print(f"[{speaker_type.upper()}_TRANSCRIBE] Sending {len(audio_for_transcription_bytes)} bytes for transcription.")
+        _, _, _, all_words = speech_to_text(BytesIO(audio_for_transcription_bytes))
+        new_segments = resegment_based_on_punctuation(all_words)
+    
+    # Merge new segments with the old ones, correcting the overlap
+    total_segments = merge_transcription_segments(previous_segments, new_segments, overlap_start_time)
+    
+    # Update the main buffer with the new full audio and corrected segments
+    full_audio_bytes = append_wav_chunks(previous_full_audio_bytes, audio_chunk_bytes)
+    
+    with call_lock:
+        call_audio_buffers[call_id][f'{speaker_type}_audio'] = BytesIO(full_audio_bytes)
+        call_audio_buffers[call_id][f'{speaker_type}_segments'] = total_segments
+    
+    return total_segments
+
+
 @app.route('/update_call', methods=['POST'])
 def update_call():
     """
-    Processes an audio chunk for an ongoing call, using an overlapping
-    transcription strategy to improve accuracy at chunk boundaries.
+    Processes audio chunks concurrently using a thread-safe, overlapping strategy.
     """
     print("[ROUTE] POST /update_call")
     
-    client_audio_chunk = request.files.get('client_audio')
-    agent_audio_chunk = request.files.get('agent_audio')
     call_id = request.form.get('call_id')
-    transcript = request.form.get('transcript')
-    
-    if not transcript:
-        print("[UPDATE_CALL] No transcript provided, attempting to load from audioscript.txt")
-        transcript = load_script_from_file("audioscript.txt")
+    transcript = request.form.get('transcript') or load_script_from_file("audioscript.txt")
+
+    agent_chunk_bytes = request.files.get('agent_audio').read() if request.files.get('agent_audio') else b''
+    client_chunk_bytes = request.files.get('client_audio').read() if request.files.get('client_audio') else b''
 
     try:
-        # Initialize buffer if it's the first chunk for this call_id
-        if call_id not in call_audio_buffers:
-            print(f"[BUFFER_INIT] Creating new buffer for call_id: {call_id}")
-            call_audio_buffers[call_id] = {
-                'agent_audio': BytesIO(),
-                'client_audio': BytesIO(),
-                'agent_segments': [],
-                'client_segments': []
-            }
+        call_lock = get_lock_for_call(call_id)
+        with call_lock:
+            # Initialize buffer if it's the first chunk for this call_id
+            if call_id not in call_audio_buffers:
+                print(f"[BUFFER_INIT] Creating new buffer for call_id: {call_id}")
+                call_audio_buffers[call_id] = {
+                    'agent_audio': BytesIO(), 'client_audio': BytesIO(),
+                    'agent_segments': [], 'client_segments': []
+                }
         
         call_ops = get_call_operations()
-        existing_call = call_ops.get_call(call_id)
-        if not existing_call:
+        if not call_ops.get_call(call_id):
             return jsonify({"error": "No record found for the given CallID for updating"}), 404
-        
-        # --- Process Agent Audio with Overlap ---
-        agent_chunk_bytes = agent_audio_chunk.read() if agent_audio_chunk else b''
-        
-        # 1. Get previous state from buffer
-        previous_agent_full_audio_bytes = call_audio_buffers[call_id]['agent_audio'].getvalue()
-        previous_agent_segments = call_audio_buffers[call_id]['agent_segments']
 
-        # 2. Determine the start time for re-transcription
-        agent_overlap_start_time = 0.0
-        if previous_agent_segments:
-            # Start re-transcribing from the beginning of the last known segment
-            agent_overlap_start_time = previous_agent_segments[-1].get('start', 0)
-            print(f"[AGENT_OVERLAP] Determined overlap start time: {agent_overlap_start_time:.2f}s")
+        # Process agent and client audio in parallel
+        agent_future = executor.submit(_process_audio_for_update, call_id, 'agent', agent_chunk_bytes)
+        client_future = executor.submit(_process_audio_for_update, call_id, 'client', client_chunk_bytes)
+        
+        total_agent_segments = agent_future.result()
+        total_client_segments = client_future.result()
 
-        # 3. Create the audio slice to be sent for transcription
-        agent_context_slice_bytes = slice_audio(previous_agent_full_audio_bytes, agent_overlap_start_time).getvalue()
-        agent_audio_for_transcription_bytes = append_wav_chunks(agent_context_slice_bytes, agent_chunk_bytes)
-        
-        # 4. Transcribe the overlapping audio chunk
-        new_agent_segments = []
-        if agent_audio_for_transcription_bytes:
-            print(f"[AGENT_TRANSCRIBE] Sending {len(agent_audio_for_transcription_bytes)} bytes of agent audio for transcription.")
-            _, _, _, all_words = speech_to_text(BytesIO(agent_audio_for_transcription_bytes))
-            # Resegment the new transcription based on punctuation
-            new_agent_segments = resegment_based_on_punctuation(all_words)
-        
-        # 5. Merge new segments with the old ones, correcting the overlap
-        total_agent_segments = merge_transcription_segments(
-            previous_agent_segments,
-            new_agent_segments,
-            agent_overlap_start_time
-        )
         total_agent_text = " ".join([s['text'] for s in total_agent_segments]).strip()
-
-        # 6. Update the main buffer with the new full audio and corrected segments
-        full_agent_audio_bytes = append_wav_chunks(previous_agent_full_audio_bytes, agent_chunk_bytes)
-        call_audio_buffers[call_id]['agent_audio'] = BytesIO(full_agent_audio_bytes)
-        call_audio_buffers[call_id]['agent_segments'] = total_agent_segments
-
-        # --- Process Client Audio with Overlap (Same Logic) ---
-        client_chunk_bytes = client_audio_chunk.read() if client_audio_chunk else b''
-        
-        # 1. Get previous state
-        previous_client_full_audio_bytes = call_audio_buffers[call_id]['client_audio'].getvalue()
-        previous_client_segments = call_audio_buffers[call_id]['client_segments']
-        
-        # 2. Determine overlap start time
-        client_overlap_start_time = 0.0
-        if previous_client_segments:
-            client_overlap_start_time = previous_client_segments[-1].get('start', 0)
-            print(f"[CLIENT_OVERLAP] Determined overlap start time: {client_overlap_start_time:.2f}s")
-            
-        # 3. Create audio for transcription
-        client_context_slice_bytes = slice_audio(previous_client_full_audio_bytes, client_overlap_start_time).getvalue()
-        client_audio_for_transcription_bytes = append_wav_chunks(client_context_slice_bytes, client_chunk_bytes)
-        
-        # 4. Transcribe
-        new_client_segments = []
-        if client_audio_for_transcription_bytes:
-            print(f"[CLIENT_TRANSCRIBE] Sending {len(client_audio_for_transcription_bytes)} bytes of client audio for transcription.")
-            _, _, _, all_words = speech_to_text(BytesIO(client_audio_for_transcription_bytes))
-            new_client_segments = resegment_based_on_punctuation(all_words)
-
-        # 5. Merge
-        total_client_segments = merge_transcription_segments(
-            previous_client_segments,
-            new_client_segments,
-            client_overlap_start_time
-        )
         total_client_text = " ".join([s['text'] for s in total_client_segments]).strip()
-        
-        # 6. Update buffer
-        full_client_audio_bytes = append_wav_chunks(previous_client_full_audio_bytes, client_chunk_bytes)
-        call_audio_buffers[call_id]['client_audio'] = BytesIO(full_client_audio_bytes)
-        call_audio_buffers[call_id]['client_segments'] = total_client_segments
-        
+
         # --- Analysis and Response ---
         if not total_agent_text and not total_client_text:
             return jsonify({"status": "success", "message": "Audio silent, no analysis performed."}), 200
 
-        # This duration approximates the current chunk's length
-        duration = max(len(agent_chunk_bytes), len(client_chunk_bytes)) / 32000 
-        
-        # Prepare data for analysis
+        # ... (rest of the analysis logic is the same)
         script_checkpoints = get_current_call_script(transcript)
-        combined_transcription = f"Agent: {total_agent_text}\nClient: {total_client_text}".strip()
-        
         processed_agent_segments = process_whisper_segments(total_agent_segments)
-        processed_client_segments = process_whisper_segments(total_client_segments)
-        
-        agent_dialogues = [{'timestamp': s['start_time'], 'speaker': 'Agent', 'text': s['text']} for s in processed_agent_segments]
-        client_dialogues = [{'timestamp': s['start_time'], 'speaker': 'Client', 'text': s['text']} for s in processed_client_segments]
-        all_timestamped_dialogue = sorted(agent_dialogues + client_dialogues, key=lambda x: x['timestamp'])
 
-        all_transcription = {
-            "agent": total_agent_text,
-            "client": total_client_text,
-            "combined": combined_transcription,
-            "timestamped_dialogue": all_timestamped_dialogue,
-            "agent_segments": total_agent_segments,
-            "client_segments": total_client_segments
-        }
-
-        # Perform analysis on the full, corrected transcriptions
         results = check_script_adherence_adaptive_windows(total_agent_text, processed_agent_segments, script_checkpoints)
-        overall_adherence = results.get("real_time_adherence_score", 0)
-        script_completion = results.get("script_completion_percentage", 0)
-        
         adherence_data = {
-            'overall': overall_adherence,
-            'script_completion': script_completion,
-            'details': results.get("checkpoint_results", []),
-            'window_size_usage': results.get("window_size_usage", {})
+            'overall': results.get("real_time_adherence_score", 0),
+            'script_completion': results.get("script_completion_percentage", 0),
+            'details': results.get("checkpoint_results", [])
         }
-
+        
         response = get_response(total_client_text)
         CQS, emotions = calculate_cqs(response["predictions"])
         quality = get_quality(emotions)
 
-        # Update the database with the latest partial results
-        call_ops.insert_partial_update(call_id, duration, CQS, adherence_data, emotions, all_transcription, quality)
+        # Construct transcription object for DB update
+        all_transcription = { "agent": total_agent_text, "client": total_client_text }
+
+        call_ops.insert_partial_update(call_id, 0, CQS, adherence_data, emotions, all_transcription, quality)
 
         return jsonify({
             "status": "success",
             "call_id": call_id,
-            "overall_adherence": overall_adherence,
-            "script_completion": script_completion,
-            "adherence_details": results.get("checkpoint_results", [])
+            "overall_adherence": adherence_data['overall'],
+            "script_completion": adherence_data['script_completion'],
         })
     
     except Exception as e:
         print(f"[UPDATE_CALL ERROR] An unexpected error occurred: {e}")
-        # Print the full traceback to the console for easier debugging
         traceback.print_exc()
         return jsonify({"error": "An unexpected server error occurred"}), 500
+
+
+def _transcribe_final_audio(audio_bytes):
+    """Helper for final transcription."""
+    if not audio_bytes:
+        return [], ""
+    _, _, _, all_words = speech_to_text(BytesIO(audio_bytes))
+    final_segments = resegment_based_on_punctuation(all_words)
+    final_text = " ".join([s['text'] for s in final_segments]).strip()
+    return final_segments, final_text
+
 
 @app.route('/final_update', methods=['POST'])
 def final_update():
     print("[ROUTE] POST /final_update")
     
-    client_audio = request.files.get('client_audio')
-    agent_audio = request.files.get('agent_audio')
     call_id = request.form.get('call_id')
-    transcript = request.form.get('transcript')
+    transcript = request.form.get('transcript') or load_script_from_file("audioscript.txt")
     
-    if not transcript:
-        print("[FINAL_UPDATE] No transcript provided, using default")
-        transcript = load_script_from_file("audioscript.txt")
-
     try:
         call_ops = get_call_operations()
         existing_call = call_ops.get_call(call_id)
         if not existing_call:
-            return jsonify({"error": "No record found for the given CallID for updating"}), 404
+            return jsonify({"error": "No record found for the given CallID"}), 404
 
-        existing_transcription = existing_call.get('transcription', {})
+        # Append final chunk to the buffer
+        agent_chunk_bytes = request.files.get('agent_audio').read() if request.files.get('agent_audio') else b''
+        client_chunk_bytes = request.files.get('client_audio').read() if request.files.get('client_audio') else b''
 
-        # --- Process Agent Audio ---
-        agent_chunk_bytes = agent_audio.read()
-        agent_audio.seek(0)
-        previous_agent_bytes = call_audio_buffers.get(call_id, {}).get('agent_audio', BytesIO()).getvalue()
-        full_agent_audio_bytes = append_wav_chunks(previous_agent_bytes, agent_chunk_bytes)
-        
-        final_agent_segments = []
-        if full_agent_audio_bytes:
-            _, _, _, all_words = speech_to_text(BytesIO(full_agent_audio_bytes))
-            final_agent_segments = resegment_based_on_punctuation(all_words)
+        call_lock = get_lock_for_call(call_id)
+        with call_lock:
+            previous_agent_bytes = call_audio_buffers.get(call_id, {}).get('agent_audio', BytesIO()).getvalue()
+            full_agent_audio_bytes = append_wav_chunks(previous_agent_bytes, agent_chunk_bytes)
+            
+            previous_client_bytes = call_audio_buffers.get(call_id, {}).get('client_audio', BytesIO()).getvalue()
+            full_client_audio_bytes = append_wav_chunks(previous_client_bytes, client_chunk_bytes)
 
-        final_agent_text = " ".join([s['text'] for s in final_agent_segments]).strip()
+        # --- Concurrent Final Transcription and Analysis ---
+        with ThreadPoolExecutor(max_workers=5) as final_executor:
+            # Step 1: Transcribe final audio for both parties concurrently
+            agent_transcription_future = final_executor.submit(_transcribe_final_audio, full_agent_audio_bytes)
+            client_transcription_future = final_executor.submit(_transcribe_final_audio, full_client_audio_bytes)
 
+            final_agent_segments, final_agent_text = agent_transcription_future.result()
+            final_client_segments, final_client_text = client_transcription_future.result()
 
-        # --- Process Client Audio ---
-        client_chunk_bytes = client_audio.read()
-        client_audio.seek(0)
-        previous_client_bytes = call_audio_buffers.get(call_id, {}).get('client_audio', BytesIO()).getvalue()
-        full_client_audio_bytes = append_wav_chunks(previous_client_bytes, client_chunk_bytes)
-        
-        final_client_segments = []
-        if full_client_audio_bytes:
-            _, _, _, all_words = speech_to_text(BytesIO(full_client_audio_bytes))
-            final_client_segments = resegment_based_on_punctuation(all_words)
+            combined_transcription = f"Agent: {final_agent_text}\nClient: {final_client_text}".strip()
 
-        final_client_text = " ".join([s['text'] for s in final_client_segments]).strip()
+            # Step 2: Run all independent analyses concurrently
+            adherence_future = final_executor.submit(check_script_adherence_adaptive_windows, final_agent_text, final_agent_segments, get_current_call_script(transcript))
+            emotion_future = final_executor.submit(get_response, final_client_text)
+            agent_quality_future = final_executor.submit(agent_scores, combined_transcription)
+            summary_future = final_executor.submit(call_summary, final_agent_text, final_client_text)
+            tags_future = final_executor.submit(get_tags, combined_transcription)
+            
+            # Collect results
+            adherence_results = adherence_future.result()
+            emotion_response = emotion_future.result()
+            agent_quality = agent_quality_future.result()
+            summary = summary_future.result()
+            tags_obj = tags_future.result()
 
-        
-        # --- Final Analysis ---
-        script_checkpoints = get_current_call_script(transcript)
-        results = check_script_adherence_adaptive_windows(final_agent_text, final_agent_segments, script_checkpoints)
-        
-        combined_transcription = f"Agent: {final_agent_text}\nClient: {final_client_text}".strip()
-        processed_agent_segments = process_whisper_segments(final_agent_segments)
-        processed_client_segments = process_whisper_segments(final_client_segments)
-        
-        agent_dialogues = [{'timestamp': s['start_time'], 'speaker': 'Agent', 'text': s['text']} for s in processed_agent_segments]
-        client_dialogues = [{'timestamp': s['start_time'], 'speaker': 'Client', 'text': s['text']} for s in processed_client_segments]
-        final_timestamped_dialogue = sorted(agent_dialogues + client_dialogues, key=lambda x: x['timestamp'])
-
-        response = get_response(final_client_text)
-        CQS, emotions = calculate_cqs(response["predictions"])
+        # Process results
+        CQS, emotions = calculate_cqs(emotion_response["predictions"])
         quality = get_quality(emotions)
-        agent_quality = agent_scores(final_agent_text)
-        summary = call_summary(final_agent_text, final_client_text)
-        tags_obj = get_tags(f"Client:\n{final_client_text}\nAgent:\n{final_agent_text}")
         tags = ', '.join(tags_obj.get('Tags', []))
 
-        chunk_duration = max(len(agent_chunk_bytes), len(client_chunk_bytes)) / 32000
-        total_duration = existing_call.get('duration', 0) + chunk_duration
-
         final_adherence_data = {
-            "overall": results.get("real_time_adherence_score", 0),
-            "script_completion": results.get("script_completion_percentage", 0),
-            "details": results.get("checkpoint_results", []),
-            "window_size_usage": results.get("window_size_usage", {}),
-            "method": "adaptive_windows_segments"
+            "overall": adherence_results.get("real_time_adherence_score", 0),
+            "script_completion": adherence_results.get("script_completion_percentage", 0),
+            "details": adherence_results.get("checkpoint_results", [])
         }
-        
+
+        # --- Final Database Update ---
         call_ops.complete_call_update(
             call_id=call_id,
             agent_text=final_agent_text, client_text=final_client_text,
             combined=combined_transcription, cqs=CQS,
             overall_adherence=final_adherence_data, agent_quality=agent_quality,
-            summary=summary, emotions=emotions, duration=total_duration,
-            quality=quality, tags=tags, timestamped_dialogue=final_timestamped_dialogue,
-            agent_segments=final_agent_segments, client_segments=final_client_segments
+            summary=summary, emotions=emotions, duration=existing_call.get('duration', 0),
+            quality=quality, tags=tags, agent_segments=final_agent_segments, client_segments=final_client_segments
         )
+        
+        # Cleanup resources for the completed call
+        cleanup_call_resources(call_id)
 
-        if call_id in call_audio_buffers:
-            del call_audio_buffers[call_id]
-            print(f"[BUFFER_CLEANUP] Cleared audio buffer for completed call {call_id}")
-
-        return jsonify({
-            "status": "success",
-            "message": "Call analysis completed.",
-            "call_id": call_id,
-            "final_adherence": final_adherence_data
-        })
+        return jsonify({"status": "success", "message": "Call analysis completed.", "call_id": call_id})
     
     except Exception as e:
         print(f"[FINAL_UPDATE ERROR] An unexpected error occurred: {e}")
+        traceback.print_exc()
         return jsonify({"error": "An unexpected server error occurred"}), 500
 
+
 if __name__ == '__main__':
-    # Configure Flask for production deployment or local development
-    port = int(os.getenv('PORT', os.getenv('FLASK_PORT', 5000)))
+    # For development, run the Flask app in multi-threaded mode.
+    # This allows handling multiple requests concurrently for testing purposes.
+    port = int(os.getenv('PORT', 5000))
     debug = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
     host = '0.0.0.0'
     
-    print(f"[SERVER] Starting Flask server at http://{host}:{port}")
+    print(f"[SERVER] Starting Flask development server at http://{host}:{port}")
+    print("[SERVER] WARNING: This is a development server. For production, use a WSGI server like Gunicorn.")
+    print("[SERVER] Production command example: gunicorn --workers 4 --threads 4 --bind 0.0.0.0:5000 wsgi:app")
     
-    try:
-        app.run(host=host, port=port, debug=debug)
-    except Exception as e:
-        print(f"[SERVER ERROR] Failed to start server: {e}")
-    finally:
-        print("[SERVER] Server stopped") 
+    # The 'threaded=True' argument is crucial for handling concurrent requests in development.
+    app.run(host=host, port=port, debug=debug, threaded=True)

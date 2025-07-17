@@ -244,9 +244,9 @@ class CallOperations:
             traceback.print_exc()
 
     def complete_call_update(self, call_id, agent_text, client_text, combined, cqs, overall_adherence, 
-                             agent_quality, summary, emotions, duration, quality, tags, timestamped_dialogue,
+                             agent_quality, summary, emotions, duration, quality, tags,
                              agent_segments, client_segments):
-        """Complete call update using optimized schema"""
+        """Complete call update using optimized schema (timestamped_dialogue argument removed)"""
         try:
             print(f"[DB_OPS] 🏁 Starting final update for call_id: {call_id}")
             
@@ -275,7 +275,7 @@ class CallOperations:
             print(f"[DB_OPS] ├── Duration increment: {duration}s")
             print(f"[DB_OPS] ├── Agent quality questions: {len(agent_quality) if isinstance(agent_quality, dict) else 0}")
             print(f"[DB_OPS] ├── Emotion types: {len(emotions) if isinstance(emotions, dict) else 0}")
-            print(f"[DB_OPS] ├── Timestamped dialogue entries: {len(timestamped_dialogue) if isinstance(timestamped_dialogue, list) else 0}")
+            # Removed timestamped_dialogue print
             
             # Store only optimized conversation array - legacy fields computed on-demand
             update_doc = {
