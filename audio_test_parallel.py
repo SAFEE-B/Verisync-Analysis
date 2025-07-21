@@ -14,6 +14,7 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import uuid
+import bson
 from audio_test_script import AudioChunkTester
 
 
@@ -26,8 +27,9 @@ def run_single_call(call_index, args, custom_script=None):
         call_id=call_id,
         transcript_content=custom_script,
         test_mode=args.test_mode,
-        agent_id=f"agent_{call_index}",
-        customer_id=f"customer_{call_index}"
+        agent_id=str(bson.ObjectId()),
+        sip_id=f"sip_{call_index}",
+        include_silent=args.include_silent
     )
     return {
         'call_id': call_id,
@@ -37,13 +39,15 @@ def run_single_call(call_index, args, custom_script=None):
 def main():
     parser = argparse.ArgumentParser(description='Run multiple parallel audio chunking test calls.')
     parser.add_argument('--audio_file', required=True, help='Path to WAV audio file')
-    parser.add_argument('--num_calls', type=int, default=5, help='Number of parallel calls to simulate (default: 5)')
+    parser.add_argument('--num_calls', type=int, default=1, help='Number of parallel calls to simulate (default: 5)')
     parser.add_argument('--server_url', default='http://localhost:5000', help='Server URL (default: http://localhost:5000)')
     parser.add_argument('--chunk_duration', type=int, default=10, help='Chunk duration in seconds (default: 10)')
     parser.add_argument('--test_mode', choices=['alternating', 'client_only', 'agent_only', 'both'], 
                         default='both', help='How to distribute chunks (default: both)')
     parser.add_argument('--script', help='Path to custom script file in XML format')
     parser.add_argument('--max_workers', type=int, default=10, help='Max parallel threads (default: 10)')
+    parser.add_argument('--include_silent', action='store_true', 
+                        help='Include silent 10-second chunks alternating with audio chunks')
     args = parser.parse_args()
 
     # Load custom script if provided
@@ -58,6 +62,8 @@ def main():
             return False
 
     print(f"[PARALLEL TEST] Launching {args.num_calls} parallel calls...")
+    if args.include_silent:
+        print(f"[PARALLEL TEST] Including silent chunks between audio chunks")
     start_time = time.time()
     results = []
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:

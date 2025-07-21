@@ -22,6 +22,9 @@ import traceback # Make sure to import traceback at the top of your file for bet
 # REMOVED: Global in-memory buffers - now using database-backed storage for concurrent processing
 # All audio chunks and segments are stored in MongoDB with GridFS for thread-safe operations
 
+# Silent Audio Detection Configuration
+SILENT_AUDIO_THRESHOLD = 1e-12  # no_speech_prob threshold above which segments are filtered out
+
 
 
 def merge_transcription_segments(previous_segments, new_segments, overlap_start_time):
@@ -36,60 +39,17 @@ def merge_transcription_segments(previous_segments, new_segments, overlap_start_
     Returns:
         list: The final, merged list of segments.
     """
-    print(f"[MERGE_SEGMENTS] Starting merge with {len(previous_segments)} previous segments, {len(new_segments)} new segments, overlap_start_time: {overlap_start_time:.2f}s")
-    
-    if previous_segments:
-        print(f"[MERGE_SEGMENTS] Previous segments timeline:")
-        for i, seg in enumerate(previous_segments):
-            print(f"[MERGE_SEGMENTS]   {i+1}. {seg.get('start', 0):.2f}s-{seg.get('end', 0):.2f}s: '{seg.get('text', '')[:40]}...'")
-    
-    if new_segments:
-        print(f"[MERGE_SEGMENTS] New segments timeline (before adjustment):")
-        for i, seg in enumerate(new_segments):
-            print(f"[MERGE_SEGMENTS]   {i+1}. {seg.get('start', 0):.2f}s-{seg.get('end', 0):.2f}s: '{seg.get('text', '')[:40]}...'")
-    
     if not previous_segments:
-        print(f"[MERGE_SEGMENTS] No previous segments, returning new segments as-is")
         return new_segments
 
-    # Find the index of the last segment in the previous list that should be replaced.
-    # We remove any segments that started at or after the overlap point.
-    first_segment_to_replace_index = -1
-    for i, segment in enumerate(previous_segments):
-        if segment.get('start', 0) >= overlap_start_time:
-            first_segment_to_replace_index = i
-            break
+    # Remove all previous segments that start at or after the overlap point
+    base_segments = [seg for seg in previous_segments if seg.get('start', 0) < overlap_start_time]
 
-    # If no segment was found to replace (e.g., silence), just append.
-    if first_segment_to_replace_index == -1:
-        base_segments = previous_segments
-        print(f"[MERGE_SEGMENTS] No segments found at or after overlap point, keeping all {len(base_segments)} previous segments")
-    else:
-        base_segments = previous_segments[:first_segment_to_replace_index]
-        removed_count = len(previous_segments) - first_segment_to_replace_index
-        print(f"[MERGE_SEGMENTS] Removing {removed_count} segments starting from index {first_segment_to_replace_index}, keeping {len(base_segments)} base segments")
+    # The new segments' timestamps should already be absolute (adjusted in transcription)
+    # So we just append them directly
+    final_segments = base_segments + new_segments
 
-    # The new segments' timestamps are relative to the start of the audio sent to Whisper.
-    # We need to adjust them to be absolute timestamps in the context of the full call.
-    adjusted_new_segments = []
-    print(f"[MERGE_SEGMENTS] Adjusting new segment timestamps by adding {overlap_start_time:.2f}s:")
-    for i, segment in enumerate(new_segments):
-        adjusted_segment = segment.copy()
-        original_start = segment['start']
-        original_end = segment['end']
-        adjusted_segment['start'] = round(overlap_start_time + segment['start'], 4)
-        adjusted_segment['end'] = round(overlap_start_time + segment['end'], 4)
-        adjusted_new_segments.append(adjusted_segment)
-        print(f"[MERGE_SEGMENTS]   {i+1}. {original_start:.2f}s-{original_end:.2f}s → {adjusted_segment['start']:.2f}s-{adjusted_segment['end']:.2f}s: '{segment.get('text', '')[:40]}...'")
-
-    # Combine the base segments with the newly transcribed and adjusted ones
-    final_segments = base_segments + adjusted_new_segments
-    
-    print(f"[MERGE_SEGMENTS] Final merged timeline ({len(final_segments)} total segments):")
-    for i, seg in enumerate(final_segments):
-        print(f"[MERGE_SEGMENTS]   {i+1}. {seg.get('start', 0):.2f}s-{seg.get('end', 0):.2f}s: '{seg.get('text', '')[:40]}...'")
-
-    print(f"[MERGE_SEGMENTS] Merged {len(base_segments)} base segments with {len(adjusted_new_segments)} new segments. Total: {len(final_segments)}")
+    print(f"[MERGE_SEGMENTS] Merged {len(base_segments)} base segments with {len(new_segments)} new segments. Total: {len(final_segments)}")
     return final_segments
 
 
@@ -379,7 +339,7 @@ def process_whisper_segments(segments):
         word_count = len(text.split())
         duration = end_time - start_time
         
-        print(f"[SEGMENTS] Segment {i+1}: '{text}' ({word_count} words, {duration:.2f}s)")
+        print(f"[SEGMENTS] Segment {i+1}: '{text}' ({word_count} words, {duration:.2f}s), start {start_time}, end {end_time}")
         
         processed_segment = {
             'start_time': start_time,
@@ -740,6 +700,8 @@ def check_script_adherence_adaptive_windows(agent_text, agent_segments, script_c
     }
 
 def get_quality(emotions):
+
+    print("EMOTION RECEIVED:", emotions)
     """Calculate call quality based on emotions"""
     positive = ["joy", "neutral", "gratitude", "admiration", "optimism", "relief", "caring"]
     negative = ["anger", "annoyance", "disappointment", "disapproval", "sadness", "confusion", "embarrassment"]
@@ -775,10 +737,10 @@ def detect_voice_activity(audio_file, min_speech_duration=0.5, min_silence_durat
             wav, sr = torchaudio.load(audio_file)
         if wav.shape[0] > 1:
             wav = wav.mean(dim=0, keepdim=True)
-        if sr != 16000:
-            resampler = torchaudio.transforms.Resample(sr, 16000)
+        if sr != 24000:
+            resampler = torchaudio.transforms.Resample(sr, 24000)
             wav = resampler(wav)
-            sr = 16000
+            sr = 24000
         wav = wav.squeeze()
         total_duration = len(wav) / sr
         return {
@@ -832,7 +794,7 @@ def speech_to_text(audio):
             timestamp_granularities=["segment", "word"]
         )
         
-        print("[API RESPONSE] Groq Whisper segment transcription completed")
+        print("[API RESPONSE] Groq Whisper segment transcription completed",response)
         
         if hasattr(response, 'text'):
             transcription = response.text or ""
@@ -840,7 +802,7 @@ def speech_to_text(audio):
             transcription = response.get('text', '') if isinstance(response, dict) else ""
         
         duration = vad_result['total_audio_duration']
-        
+        print('Duration is',duration)
         # Process segment-level data
         segment_data = []
         segments = None
@@ -851,20 +813,38 @@ def speech_to_text(audio):
         
         if segments:
             for segment in segments:
-                if hasattr(segment, 'text') and hasattr(segment, 'start') and hasattr(segment, 'end'):
-                    segment_data.append({
-                        'text': segment.text.strip(),
-                        'start': segment.start,
-                        'end': segment.end,
-                        'confidence': getattr(segment, 'avg_logprob', 0.0)
-                    })
-                elif isinstance(segment, dict):
-                    segment_data.append({
+                # Extract segment data including no_speech_prob
+                # Handle dictionary-style segments first (Groq format)
+                if isinstance(segment, dict):
+                    no_speech_prob = segment.get('no_speech_prob', 0.0)
+                    segment_info = {
                         'text': segment.get('text', '').strip(),
                         'start': segment.get('start', 0),
                         'end': segment.get('end', 0),
-                        'confidence': segment.get('avg_logprob', 0.0)
-                    })
+                        'confidence': segment.get('avg_logprob', 0.0),
+                        'no_speech_prob': no_speech_prob
+                    }
+                # Handle object-style segments (backup for other APIs)
+                elif hasattr(segment, 'text') and hasattr(segment, 'start') and hasattr(segment, 'end'):
+                    no_speech_prob = getattr(segment, 'no_speech_prob', 0.0)
+                    segment_info = {
+                        'text': segment.text.strip(),
+                        'start': segment.start,
+                        'end': segment.end,
+                        'confidence': getattr(segment, 'avg_logprob', 0.0),
+                        'no_speech_prob': no_speech_prob
+                    }
+                else:
+                    continue
+                
+                # Apply silent audio detection: filter out segments with high no_speech_prob
+                if no_speech_prob > SILENT_AUDIO_THRESHOLD:
+                    print(f"[SILENT_DETECTION] Filtering out silent segment: '{segment_info['text'][:50]}...' "
+                          f"(no_speech_prob: {no_speech_prob:.2e}, duration: {segment_info['end'] - segment_info['start']:.2f}s)")
+                else:
+                    segment_data.append(segment_info)
+                    print(f"[SEGMENT_KEPT] Keeping segment: '{segment_info['text'][:50]}...' "
+                          f"(no_speech_prob: {no_speech_prob:.2e})")
         
         # Process word-level data
         word_data = []
@@ -882,7 +862,14 @@ def speech_to_text(audio):
                     'end': word.get('end', 0)
                 })
 
-        print(f"[API RESPONSE] Extracted {len(segment_data)} segments and {len(word_data)} words from Whisper")
+        # Calculate silent detection statistics
+        total_segments = len(segments) if segments else 0
+        kept_segments = len(segment_data)
+        filtered_segments = total_segments - kept_segments
+        
+        print(f"[API RESPONSE] Extracted {kept_segments}/{total_segments} segments and {len(word_data)} words from Whisper")
+        if filtered_segments > 0:
+            print(f"[SILENT_DETECTION] Filtered out {filtered_segments} silent segments (threshold: {SILENT_AUDIO_THRESHOLD})")
         
         return transcription, duration, segment_data, word_data
         
@@ -923,28 +910,20 @@ def get_response(text):
     """Get emotion analysis from external API"""
     print(f"[API REQUEST] Calling emotion model API")
     
-    url = os.getenv('EMOTION_MODEL')
-    
-    headers = {
-        "accept": "application/json",
-        "Content-Type": "application/json"
-    }
-    data = {"input": text}
-    
+    url = "https://d612bc677495.ngrok-free.app/emotion"
+    payload = {"text": text}
     try:
-        response = requests.post(url, headers=headers, json=data)
+        response = requests.post(url, json=payload, timeout=2.5)
         
         if response.status_code == 200:
-            result = response.json()
-            print(f"[API RESPONSE] Emotion API call successful")
-            return result
+            print("[API RESPONSE] Emotion model API response received")
+            # print(f"{response}")
+            return response.json()
         else:
-            print(f"[API ERROR] Emotion API returned status {response.status_code}")
-            return {"predictions": [{"label": "neutral", "score": 1.0}]}
-            
+            print("Sentiment server error:", response.text)
     except Exception as e:
-        print(f"[API ERROR] Exception calling emotion API: {e}")
-        return {"predictions": [{"label": "neutral", "score": 1.0}]}
+        print("Sentiment server not responding:", str(e))
+    return None
 
 def calculate_cqs(predictions):
     """Calculate Customer Quality Score based on emotions"""
@@ -954,15 +933,24 @@ def calculate_cqs(predictions):
         "anger": -2.5, "disapproval": -2.25, "disappointment": -2.0, "annoyance": -1.75, "sadness": -1.5, "embarrassment": -1.0, "confusion": -0.5
     }
     cqs = 0
-    emotions = {}
-    for emotion in predictions:
-        label = emotion["label"].lower()
-        score = emotion["score"]
-        if label in emotion_weights:
-            emotions[label] = round(score, 2)
-            weighted_contribution = emotion_weights[label] * score
-            cqs += weighted_contribution
-    final_cqs = round(cqs, 2)
+    emotions = predictions
+    emotions = dict(emotions[0])
+
+    print(emotions,"------------------------")
+    confidence = emotions['score']
+    emotion_recieved = emotions['label'].lower()
+    if emotion_recieved in emotion_weights:
+        default_cqs = emotion_weights[emotion_recieved] * confidence
+    else:
+        default_cqs = 0.1    # for emotion in predictions:
+    #     label = emotion["label"].lower()
+    #     # score = emotion["score"]
+    #     if label in emotion_weights:
+    #         # emotions[label] = round(score, 2)
+    #         weighted_contribution = emotion_weights[label] * score
+    #         cqs += weighted_contribution
+    cqs = default_cqs
+    final_cqs = abs(round(cqs, 2))
     result = [final_cqs, emotions]
     return result
 
@@ -1146,11 +1134,11 @@ def create_call():
     
     call_id = request.form.get('call_id')
     agent_id = request.form.get('agent_id')
-    customer_id = request.form.get('customer_id')
+    sip_id = request.form.get('sip_id')
     script_text = request.form.get('transcript')
 
     call_ops = get_call_operations()
-    success = call_ops.create_call(call_id, agent_id, customer_id, script_text)
+    success = call_ops.create_call(call_id, agent_id, sip_id, script_text)
 
     if success:
         return jsonify({"status": "success", "message": f"Call record for {call_id} created or already exists."}), 201
@@ -1160,8 +1148,11 @@ def create_call():
 @app.route('/update_call', methods=['POST'])
 def update_call():
     """
-    Processes an audio chunk for an ongoing call using database-backed storage
-    for concurrent processing and overlapping transcription strategy.
+    Processes an audio chunk for an ongoing call using the new optimized flow:
+    1. Store chunks in DB and get audio from last segment start to chunk end
+    2. Transcribe this audio segment
+    3. Process analysis on the transcribed content
+    4. Update segments and other data via insert_partial_update
     """
     print("[ROUTE] POST /update_call")
     
@@ -1180,43 +1171,94 @@ def update_call():
         if not existing_call:
             return jsonify({"error": "No record found for the given CallID for updating"}), 404
         
-        # Store audio chunks and get processing data using database-backed approach
+        # STEP 1: Store audio chunks and get processing data using the new optimized approach
+        print("[UPDATE_CALL] Step 1: Storing chunks and getting processing audio...")
         processing_data = call_ops.store_audio_chunk_and_process(call_id, client_audio_chunk, agent_audio_chunk)
         
         # Extract processing results
         previous_agent_segments = processing_data.get("agent_segments", [])
         previous_client_segments = processing_data.get("client_segments", [])
-        agent_overlap_start_time = processing_data.get("agent_overlap_start", 0.0)
-        client_overlap_start_time = processing_data.get("client_overlap_start", 0.0)
+        last_agent_segment_start = processing_data.get("agent_overlap_start", 0.0)
+        last_client_segment_start = processing_data.get("client_overlap_start", 0.0)
         agent_audio_for_transcription = processing_data.get("agent_audio_for_transcription")
         client_audio_for_transcription = processing_data.get("client_audio_for_transcription")
+        processing_context = processing_data.get("processing_context", {})
         
-        # --- Process Agent and Client Audio in Parallel ---
+        print(f"[UPDATE_CALL] Processing context: {processing_context}")
+        
+        # Handle BytesIO objects for size reporting
+        agent_audio_size = 0
+        client_audio_size = 0
+        
+        if agent_audio_for_transcription:
+            if hasattr(agent_audio_for_transcription, 'getvalue'):
+                agent_audio_size = len(agent_audio_for_transcription.getvalue())
+            else:
+                agent_audio_size = len(agent_audio_for_transcription)
+        
+        if client_audio_for_transcription:
+            if hasattr(client_audio_for_transcription, 'getvalue'):
+                client_audio_size = len(client_audio_for_transcription.getvalue())
+            else:
+                client_audio_size = len(client_audio_for_transcription)
+        
+        print(f"[UPDATE_CALL] Agent audio from {last_agent_segment_start}s: {agent_audio_size} bytes")
+        print(f"[UPDATE_CALL] Client audio from {last_client_segment_start}s: {client_audio_size} bytes")
+        
+        # STEP 2: Transcribe the audio segment from last segment start to chunk end
+        print("[UPDATE_CALL] Step 2: Transcribing audio segment...")
         import concurrent.futures
         
         def transcribe_agent_audio():
-            """Transcribe agent audio in parallel"""
+            """Transcribe agent audio segment in parallel"""
             if agent_audio_for_transcription:
-                print(f"[AGENT_TRANSCRIBE] Sending {len(agent_audio_for_transcription)} bytes of agent audio for transcription.")
-                _, _, _, all_words = speech_to_text(BytesIO(agent_audio_for_transcription))
-                return resegment_based_on_punctuation(all_words)
+                audio_size = agent_audio_for_transcription.getvalue().__len__() if hasattr(agent_audio_for_transcription, 'getvalue') else len(agent_audio_for_transcription)
+                print(f"[AGENT_TRANSCRIBE] Processing {audio_size} bytes from {last_agent_segment_start}s onward")
+                
+                # Handle both BytesIO objects and raw bytes
+                if hasattr(agent_audio_for_transcription, 'seek'):
+                    agent_audio_for_transcription.seek(0)  # Reset position if it's a BytesIO
+                    audio_input = agent_audio_for_transcription
+                else:
+                    audio_input = BytesIO(agent_audio_for_transcription)
+                
+                _, _, _, all_words = speech_to_text(audio_input)
+                # Adjust timestamps to account for the segment start time
+                adjusted_segments = resegment_based_on_punctuation(all_words)
+                for segment in adjusted_segments:
+                    segment['start'] += last_agent_segment_start
+                    segment['end'] += last_agent_segment_start
+                return adjusted_segments
             return []
         
         def transcribe_client_audio():
-            """Transcribe client audio in parallel"""
+            """Transcribe client audio segment in parallel"""
             if client_audio_for_transcription:
-                print(f"[CLIENT_TRANSCRIBE] Sending {len(client_audio_for_transcription)} bytes of client audio for transcription.")
-                _, _, _, all_words = speech_to_text(BytesIO(client_audio_for_transcription))
-                return resegment_based_on_punctuation(all_words)
+                audio_size = client_audio_for_transcription.getvalue().__len__() if hasattr(client_audio_for_transcription, 'getvalue') else len(client_audio_for_transcription)
+                print(f"[CLIENT_TRANSCRIBE] Processing {audio_size} bytes from {last_client_segment_start}s onward")
+                
+                # Handle both BytesIO objects and raw bytes
+                if hasattr(client_audio_for_transcription, 'seek'):
+                    client_audio_for_transcription.seek(0)  # Reset position if it's a BytesIO
+                    audio_input = client_audio_for_transcription
+                else:
+                    audio_input = BytesIO(client_audio_for_transcription)
+                
+                _, _, _, all_words = speech_to_text(audio_input)
+                # Adjust timestamps to account for the segment start time
+                adjusted_segments = resegment_based_on_punctuation(all_words)
+                for segment in adjusted_segments:
+                    segment['start'] += last_client_segment_start
+                    segment['end'] += last_client_segment_start
+                return adjusted_segments
             return []
         
         # Execute transcriptions in parallel
         import time
         start_time = time.time()
-        print("[PARALLEL_TRANSCRIBE] Starting parallel transcription for agent and client...")
+        print("[UPDATE_CALL] Starting parallel transcription...")
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            # Submit both transcription tasks
             agent_future = executor.submit(transcribe_agent_audio)
             client_future = executor.submit(transcribe_client_audio)
             
@@ -1226,45 +1268,46 @@ def update_call():
         
         end_time = time.time()
         transcription_time = end_time - start_time
-        print(f"[PARALLEL_TRANSCRIBE] Parallel transcription completed in {transcription_time:.2f}s")
+        print(f"[UPDATE_CALL] Transcription completed in {transcription_time:.2f}s")
+        print(f"[UPDATE_CALL] New agent segments: {len(new_agent_segments)}")
+        print(f"[UPDATE_CALL] New client segments: {len(new_client_segments)}")
         
-        # Merge new segments with the old ones, correcting the overlap
-        total_agent_segments = merge_transcription_segments(
-            previous_agent_segments,
-            new_agent_segments,
-            agent_overlap_start_time
-        )
-        total_agent_text = " ".join([s['text'] for s in total_agent_segments]).strip()
-
-        # Merge client segments
-        total_client_segments = merge_transcription_segments(
-            previous_client_segments,
-            new_client_segments,
-            client_overlap_start_time
-        )
-        total_client_text = " ".join([s['text'] for s in total_client_segments]).strip()
+        # STEP 3: Combine previous segments with new segments for complete conversation
+        print("[UPDATE_CALL] Step 3: Building complete conversation...")
+        # Combine existing segments with new ones (new segments replace overlapping ones)
+        all_agent_segments = merge_transcription_segments(previous_agent_segments, new_agent_segments, last_agent_segment_start)
+        all_client_segments = merge_transcription_segments(previous_client_segments, new_client_segments, last_client_segment_start)
+        print("All client segments after processing", all_agent_segments)
+        #  sort by time
+        all_agent_segments = sorted(all_agent_segments, key=lambda x: x.get('start', 0))
+        all_client_segments = sorted(all_client_segments, key=lambda x: x.get('start', 0))
         
-        # Update segments in database
-        call_ops.update_call_segments(call_id, total_agent_segments, total_client_segments)
+        # Generate text from segments
+        total_agent_text = " ".join([s['text'] for s in all_agent_segments]).strip()
+        total_client_text = " ".join([s['text'] for s in all_client_segments]).strip()
         
-        # --- Analysis and Response ---
+        print(f"[UPDATE_CALL] Total agent text length: {len(total_agent_text)} chars")
+        print(f"[UPDATE_CALL] Total client text length: {len(total_client_text)} chars")
+        
+        # STEP 4: Perform analysis on the complete conversation
+        print("[UPDATE_CALL] Step 4: Performing analysis...")
+        
         if not total_agent_text and not total_client_text:
+            print("[UPDATE_CALL] No text to analyze, returning success")
             return jsonify({"status": "success", "message": "Audio silent, no analysis performed."}), 200
 
-        # Calculate duration from audio data (approximation)
-        agent_size = len(agent_audio_for_transcription) if agent_audio_for_transcription else 0
-        client_size = len(client_audio_for_transcription) if client_audio_for_transcription else 0
-        duration = max(agent_size, client_size) / 32000 
-        
+        # Calculate duration (approximate from audio size) - reuse the sizes we calculated above
+        duration = max(agent_audio_size, client_audio_size) / 32000  # Approximate duration
+        print("second calculated duration",duration)
         # Prepare data for analysis
         script_checkpoints = get_current_call_script(transcript)
         combined_transcription = f"Agent: {total_agent_text}\nClient: {total_client_text}".strip()
         
-        processed_agent_segments = process_whisper_segments(total_agent_segments)
-        processed_client_segments = process_whisper_segments(total_client_segments)
+        processed_agent_segments = process_whisper_segments(all_agent_segments)
+        processed_client_segments = process_whisper_segments(all_client_segments)
         
-        agent_dialogues = [{'timestamp': s['start_time'], 'speaker': 'Agent', 'text': s['text']} for s in processed_agent_segments]
-        client_dialogues = [{'timestamp': s['start_time'], 'speaker': 'Client', 'text': s['text']} for s in processed_client_segments]
+        agent_dialogues = [{'timestamp': s.get('start', 0), 'speaker': 'Agent', 'text': s['text']} for s in processed_agent_segments]
+        client_dialogues = [{'timestamp': s.get('start', 0), 'speaker': 'Client', 'text': s['text']} for s in processed_client_segments]
         all_timestamped_dialogue = sorted(agent_dialogues + client_dialogues, key=lambda x: x['timestamp'])
 
         all_transcription = {
@@ -1272,11 +1315,11 @@ def update_call():
             "client": total_client_text,
             "combined": combined_transcription,
             "timestamped_dialogue": all_timestamped_dialogue,
-            "agent_segments": total_agent_segments,
-            "client_segments": total_client_segments
+            "agent_segments": all_agent_segments,
+            "client_segments": all_client_segments
         }
-
-        # Perform analysis on the full, corrected transcriptions
+        print("Total Transcription is: ",all_transcription)
+        # Perform analysis
         results = check_script_adherence_adaptive_windows(total_agent_text, processed_agent_segments, script_checkpoints)
         overall_adherence = results.get("real_time_adherence_score", 0)
         script_completion = results.get("script_completion_percentage", 0)
@@ -1289,28 +1332,45 @@ def update_call():
         }
 
         response = get_response(total_client_text)
-        CQS, emotions = calculate_cqs(response["predictions"])
+        CQS, emotions = calculate_cqs(response)
         quality = get_quality(emotions)
 
-        # Update the database with the latest partial results
+        # STEP 5: Update database with all the processed data
+        print("[UPDATE_CALL] Step 5: Updating database with processed results...")
         call_ops.insert_partial_update(call_id, duration, CQS, adherence_data, emotions, all_transcription, quality)
 
+        print("[UPDATE_CALL] Successfully completed update_call")
         return jsonify({
             "status": "success",
             "call_id": call_id,
             "overall_adherence": overall_adherence,
             "script_completion": script_completion,
-            "adherence_details": results.get("checkpoint_results", [])
+            "adherence_details": results.get("checkpoint_results", []),
+            "processing_stats": {
+                "transcription_time": transcription_time,
+                "agent_segments": len(all_agent_segments),
+                "client_segments": len(all_client_segments),
+                "audio_processed": {
+                    "agent_bytes": agent_audio_size,
+                    "client_bytes": client_audio_size
+                }
+            }
         })
     
     except Exception as e:
         print(f"[UPDATE_CALL ERROR] An unexpected error occurred: {e}")
-        # Print the full traceback to the console for easier debugging
         traceback.print_exc()
         return jsonify({"error": "An unexpected server error occurred"}), 500
 
 @app.route('/final_update', methods=['POST'])
 def final_update():
+    """
+    Processes the final audio chunk for a call using the same optimized flow as update_call:
+    1. Store chunks in DB and get audio from last segment start to chunk end
+    2. Transcribe this audio segment (or complete audio if no previous segments)
+    3. Process analysis on the complete conversation
+    4. Update segments and finalize call data
+    """
     print("[ROUTE] POST /final_update")
     
     client_audio = request.files.get('client_audio')
@@ -1328,109 +1388,160 @@ def final_update():
         if not existing_call:
             return jsonify({"error": "No record found for the given CallID for updating"}), 404
 
-        # Store final audio chunks if provided
-        if client_audio or agent_audio:
-            call_ops.store_audio_chunk_and_process(call_id, client_audio, agent_audio)
-
-        # Get complete audio and segments from database
-        full_data = call_ops.get_full_call_audio_and_segments(call_id)
+        # STEP 1: Store final audio chunks and get processing data using the same optimized approach as update_call
+        print("[FINAL_UPDATE] Step 1: Storing final chunks and getting processing audio...")
+        processing_data = call_ops.store_audio_chunk_and_process(call_id, client_audio, agent_audio)
         
-        # Extract full audio and segments
-        full_agent_audio_bytes = full_data.get("agent_audio")
-        full_client_audio_bytes = full_data.get("client_audio")
-        final_agent_segments = full_data.get("agent_segments", [])
-        final_client_segments = full_data.get("client_segments", [])
+        # Extract processing results
+        previous_agent_segments = processing_data.get("agent_segments", [])
+        previous_client_segments = processing_data.get("client_segments", [])
+        last_agent_segment_start = processing_data.get("agent_overlap_start", 0.0)
+        last_client_segment_start = processing_data.get("client_overlap_start", 0.0)
+        agent_audio_for_transcription = processing_data.get("agent_audio_for_transcription")
+        client_audio_for_transcription = processing_data.get("client_audio_for_transcription")
+        processing_context = processing_data.get("processing_context", {})
         
-        # If we have final audio but no segments, transcribe the full audio in parallel
-        need_agent_transcription = full_agent_audio_bytes and not final_agent_segments
-        need_client_transcription = full_client_audio_bytes and not final_client_segments
+        print(f"[FINAL_UPDATE] Processing context: {processing_context}")
         
-        if need_agent_transcription or need_client_transcription:
-            import concurrent.futures
-            
-            def transcribe_final_agent_audio():
-                """Transcribe final agent audio"""
-                if need_agent_transcription:
-                    print(f"[FINAL_AGENT_TRANSCRIBE] Transcribing {len(full_agent_audio_bytes)} bytes of final agent audio")
-                    _, _, _, all_words = speech_to_text(BytesIO(full_agent_audio_bytes))
-                    return resegment_based_on_punctuation(all_words)
-                return final_agent_segments
-            
-            def transcribe_final_client_audio():
-                """Transcribe final client audio"""
-                if need_client_transcription:
-                    print(f"[FINAL_CLIENT_TRANSCRIBE] Transcribing {len(full_client_audio_bytes)} bytes of final client audio")
-                    _, _, _, all_words = speech_to_text(BytesIO(full_client_audio_bytes))
-                    return resegment_based_on_punctuation(all_words)
-                return final_client_segments
-            
-            # Execute final transcriptions in parallel
-            import time
-            start_time = time.time()
-            print("[FINAL_PARALLEL_TRANSCRIBE] Starting parallel final transcription...")
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                # Submit transcription tasks
-                agent_future = executor.submit(transcribe_final_agent_audio)
-                client_future = executor.submit(transcribe_final_client_audio)
+        # Handle BytesIO objects for size reporting
+        agent_audio_size = 0
+        client_audio_size = 0
+        
+        if agent_audio_for_transcription:
+            if hasattr(agent_audio_for_transcription, 'getvalue'):
+                agent_audio_size = len(agent_audio_for_transcription.getvalue())
+            else:
+                agent_audio_size = len(agent_audio_for_transcription)
+        
+        if client_audio_for_transcription:
+            if hasattr(client_audio_for_transcription, 'getvalue'):
+                client_audio_size = len(client_audio_for_transcription.getvalue())
+            else:
+                client_audio_size = len(client_audio_for_transcription)
+        
+        print(f"[FINAL_UPDATE] Agent audio from {last_agent_segment_start}s: {agent_audio_size} bytes")
+        print(f"[FINAL_UPDATE] Client audio from {last_client_segment_start}s: {client_audio_size} bytes")
+        
+        # STEP 2: Transcribe the audio segment (or complete audio if no previous segments)
+        print("[FINAL_UPDATE] Step 2: Transcribing final audio segment...")
+        import concurrent.futures
+        
+        def transcribe_agent_audio():
+            """Transcribe agent audio segment in parallel"""
+            if agent_audio_for_transcription:
+                audio_size = agent_audio_for_transcription.getvalue().__len__() if hasattr(agent_audio_for_transcription, 'getvalue') else len(agent_audio_for_transcription)
+                print(f"[FINAL_AGENT_TRANSCRIBE] Processing {audio_size} bytes from {last_agent_segment_start}s onward")
                 
-                # Wait for both to complete
-                final_agent_segments = agent_future.result()
-                final_client_segments = client_future.result()
+                # Handle both BytesIO objects and raw bytes
+                if hasattr(agent_audio_for_transcription, 'seek'):
+                    agent_audio_for_transcription.seek(0)  # Reset position if it's a BytesIO
+                    audio_input = agent_audio_for_transcription
+                else:
+                    audio_input = BytesIO(agent_audio_for_transcription)
+                
+                _, _, _, all_words = speech_to_text(audio_input)
+                # Adjust timestamps to account for the segment start time
+                adjusted_segments = resegment_based_on_punctuation(all_words)
+                for segment in adjusted_segments:
+                    segment['start'] += last_agent_segment_start
+                    segment['end'] += last_agent_segment_start
+                return adjusted_segments
+            return []
+        
+        def transcribe_client_audio():
+            """Transcribe client audio segment in parallel"""
+            if client_audio_for_transcription:
+                audio_size = client_audio_for_transcription.getvalue().__len__() if hasattr(client_audio_for_transcription, 'getvalue') else len(client_audio_for_transcription)
+                print(f"[FINAL_CLIENT_TRANSCRIBE] Processing {audio_size} bytes from {last_client_segment_start}s onward")
+                
+                # Handle both BytesIO objects and raw bytes
+                if hasattr(client_audio_for_transcription, 'seek'):
+                    client_audio_for_transcription.seek(0)  # Reset position if it's a BytesIO
+                    audio_input = client_audio_for_transcription
+                else:
+                    audio_input = BytesIO(client_audio_for_transcription)
+                
+                _, _, _, all_words = speech_to_text(audio_input)
+                # Adjust timestamps to account for the segment start time
+                adjusted_segments = resegment_based_on_punctuation(all_words)
+                for segment in adjusted_segments:
+                    segment['start'] += last_client_segment_start
+                    segment['end'] += last_client_segment_start
+                return adjusted_segments
+            return []
+        
+        # Execute transcriptions in parallel
+        import time
+        start_time = time.time()
+        print("[FINAL_UPDATE] Starting parallel transcription...")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            agent_future = executor.submit(transcribe_agent_audio)
+            client_future = executor.submit(transcribe_client_audio)
             
-            end_time = time.time()
-            transcription_time = end_time - start_time
-            print(f"[FINAL_PARALLEL_TRANSCRIBE] Parallel final transcription completed in {transcription_time:.2f}s")
-            
-            # Update segments in database
-            if need_agent_transcription:
-                call_ops.update_call_segments(call_id, agent_segments=final_agent_segments)
-            if need_client_transcription:
-                call_ops.update_call_segments(call_id, client_segments=final_client_segments)
-
+            # Wait for both to complete
+            new_agent_segments = agent_future.result()
+            new_client_segments = client_future.result()
+        
+        end_time = time.time()
+        transcription_time = end_time - start_time
+        print(f"[FINAL_UPDATE] Transcription completed in {transcription_time:.2f}s")
+        print(f"[FINAL_UPDATE] New agent segments: {len(new_agent_segments)}")
+        print(f"[FINAL_UPDATE] New client segments: {len(new_client_segments)}")
+        
+        # STEP 3: Merge segments using the same logic as update_call
+        print("[FINAL_UPDATE] Step 3: Building complete conversation...")
+        
+        # Use merge_transcription_segments for consistency
+        final_agent_segments = merge_transcription_segments(previous_agent_segments, new_agent_segments, last_agent_segment_start)
+        final_client_segments = merge_transcription_segments(previous_client_segments, new_client_segments, last_client_segment_start)
+        
+        # Sort by time
+        final_agent_segments = sorted(final_agent_segments, key=lambda x: x.get('start', 0))
+        final_client_segments = sorted(final_client_segments, key=lambda x: x.get('start', 0))
+        
+        # Generate text from segments
         final_agent_text = " ".join([s['text'] for s in final_agent_segments]).strip()
         final_client_text = " ".join([s['text'] for s in final_client_segments]).strip()
+        
+        print(f"[FINAL_UPDATE] Final agent text length: {len(final_agent_text)} chars")
+        print(f"[FINAL_UPDATE] Final client text length: {len(final_client_text)} chars")
+        
+        # STEP 4: Perform final analysis on the complete conversation
+        print("[FINAL_UPDATE] Step 4: Performing final analysis...")
+        
+        if not final_agent_text and not final_client_text:
+            print("[FINAL_UPDATE] No text to analyze, completing with minimal data")
+            # Still complete the call even if no text
+            call_ops.complete_call_update(
+                call_id=call_id,
+                agent_text="", client_text="",
+                combined="", cqs=0,
+                overall_adherence={}, agent_quality={},
+                summary="", emotions={}, duration=existing_call.get('duration', 0),
+                quality=0, tags="", timestamped_dialogue=[],
+                agent_segments=[], client_segments=[]
+            )
+            return jsonify({"status": "success", "message": "Call completed with no transcription data."})
 
+        # Calculate duration (approximate from audio size) - reuse the sizes we calculated above
+        chunk_duration = max(agent_audio_size, client_audio_size) / 32000  # Approximate duration
+        total_duration = existing_call.get('duration', 0) + chunk_duration
         
-        # --- Final Analysis ---
+        # Prepare data for analysis
         script_checkpoints = get_current_call_script(transcript)
-        results = check_script_adherence_adaptive_windows(final_agent_text, final_agent_segments, script_checkpoints)
-        
         combined_transcription = f"Agent: {final_agent_text}\nClient: {final_client_text}".strip()
+        
         processed_agent_segments = process_whisper_segments(final_agent_segments)
         processed_client_segments = process_whisper_segments(final_client_segments)
         
-        agent_dialogues = [{'timestamp': s['start_time'], 'speaker': 'Agent', 'text': s['text']} for s in processed_agent_segments]
-        client_dialogues = [{'timestamp': s['start_time'], 'speaker': 'Client', 'text': s['text']} for s in processed_client_segments]
+        agent_dialogues = [{'timestamp': s.get('start', 0), 'speaker': 'Agent', 'text': s['text']} for s in processed_agent_segments]
+        client_dialogues = [{'timestamp': s.get('start', 0), 'speaker': 'Client', 'text': s['text']} for s in processed_client_segments]
         final_timestamped_dialogue = sorted(agent_dialogues + client_dialogues, key=lambda x: x['timestamp'])
 
-        # Get final emotion analysis for complete client transcript
-        print(f"[FINAL_UPDATE] Analyzing final emotions for complete client transcript ({len(final_client_text)} chars)")
-        final_emotion_response = get_response(final_client_text)
-        final_CQS, final_emotions = calculate_cqs(final_emotion_response["predictions"])
-        final_quality = get_quality(final_emotions)
+        # Perform final analysis
+        results = check_script_adherence_adaptive_windows(final_agent_text, processed_agent_segments, script_checkpoints)
         
-        print(f"[FINAL_UPDATE] Final emotion analysis complete:")
-        print(f"[FINAL_UPDATE] - Final CQS: {final_CQS}")
-        print(f"[FINAL_UPDATE] - Final Quality: {final_quality}")
-        print(f"[FINAL_UPDATE] - Final Emotions: {final_emotions}")
-        
-        # Keep the last chunk emotions for compatibility (from final chunk processing)
-        response = get_response(final_client_text)
-        CQS, emotions = calculate_cqs(response["predictions"])
-        quality = get_quality(emotions)
-        
-        agent_quality = agent_scores(final_agent_text)
-        summary = call_summary(final_agent_text, final_client_text)
-        tags_obj = get_tags(f"Client:\n{final_client_text}\nAgent:\n{final_agent_text}")
-        tags = ', '.join(tags_obj.get('Tags', []))
-
-        # Calculate duration from final audio sizes
-        agent_audio_size = len(full_agent_audio_bytes) if full_agent_audio_bytes else 0
-        client_audio_size = len(full_client_audio_bytes) if full_client_audio_bytes else 0
-        chunk_duration = max(agent_audio_size, client_audio_size) / 32000
-        total_duration = existing_call.get('duration', 0) + chunk_duration
-
         final_adherence_data = {
             "overall": results.get("real_time_adherence_score", 0),
             "script_completion": results.get("script_completion_percentage", 0),
@@ -1438,6 +1549,30 @@ def final_update():
             "window_size_usage": results.get("window_size_usage", {}),
             "method": "adaptive_windows_segments"
         }
+
+        # Get final emotion analysis for complete client transcript
+        print(f"[FINAL_UPDATE] Analyzing final emotions for complete client transcript ({len(final_client_text)} chars)")
+        final_emotion_response = get_response(final_client_text)
+        final_CQS, final_emotions = calculate_cqs(final_emotion_response)
+        final_quality = get_quality(final_emotions)
+        
+        print(f"[FINAL_UPDATE] Final emotion analysis complete:")
+        print(f"[FINAL_UPDATE] - Final CQS: {final_CQS}")
+        print(f"[FINAL_UPDATE] - Final Quality: {final_quality}")
+        print(f"[FINAL_UPDATE] - Final Emotions: {final_emotions}")
+        
+        # Keep the last chunk emotions for compatibility
+        response = get_response(final_client_text)
+        CQS, emotions = calculate_cqs(response)
+        quality = get_quality(emotions)
+        
+        agent_quality = agent_scores(final_agent_text)
+        summary = call_summary(final_agent_text, final_client_text)
+        tags_obj = get_tags(f"Client:\n{final_client_text}\nAgent:\n{final_agent_text}")
+        tags = ', '.join(tags_obj.get('Tags', []))
+
+        # STEP 5: Complete the call using the same structure as update_call but with complete_call_update
+        print("[FINAL_UPDATE] Step 5: Completing call with final data...")
         
         call_ops.complete_call_update(
             call_id=call_id,
@@ -1450,9 +1585,7 @@ def final_update():
             final_emotions=final_emotions
         )
 
-        # Clean up call resources (optional - can be done later for storage optimization)
-        # call_ops.cleanup_call_resources(call_id)
-
+        print("[FINAL_UPDATE] Successfully completed final_update")
         return jsonify({
             "status": "success",
             "message": "Call analysis completed.",
@@ -1464,11 +1597,21 @@ def final_update():
                 "quality": final_quality
             },
             "total_duration": total_duration,
-            "chunk_emotions_count": len(existing_call.get('emotions', [])) if existing_call else 0
+            "chunk_emotions_count": len(existing_call.get('emotions', [])) if existing_call else 0,
+            "processing_stats": {
+                "transcription_time": transcription_time,
+                "agent_segments": len(final_agent_segments),
+                "client_segments": len(final_client_segments),
+                "audio_processed": {
+                    "agent_bytes": agent_audio_size,
+                    "client_bytes": client_audio_size
+                }
+            }
         })
     
     except Exception as e:
         print(f"[FINAL_UPDATE ERROR] An unexpected error occurred: {e}")
+        traceback.print_exc()
         return jsonify({"error": "An unexpected server error occurred"}), 500
 
 @app.route('/cleanup_call', methods=['POST'])
@@ -1537,7 +1680,7 @@ if __name__ == '__main__':
     print(f"[SERVER] Concurrent processing: Ready")
     
     try:
-        app.run(host=host, port=port, debug=debug, threaded=threaded, processes=processes)
+        app.run(host=host, port=port, debug=debug, threaded=threaded, processes=processes, use_reloader=False)
     except Exception as e:
         print(f"[SERVER ERROR] Failed to start server: {e}")
     finally:
