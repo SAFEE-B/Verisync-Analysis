@@ -14,6 +14,9 @@ from sentence_transformers import SentenceTransformer, util
 import threading
 from functools import lru_cache
 import traceback # Make sure to import traceback at the top of your file for better error logging
+import soundfile as sf
+import numpy as np
+import torchaudio
 
 # =============================================================================
 # GLOBAL STATE & HELPERS
@@ -26,6 +29,56 @@ import traceback # Make sure to import traceback at the top of your file for bet
 SILENT_AUDIO_THRESHOLD = 1e-12  # no_speech_prob threshold above which segments are filtered out
 
 
+
+def resample_audio(audio_chunk, target_sr=24000):
+    """
+    Resamples an audio chunk to the target sample rate.
+
+    Args:
+        audio_chunk (FileStorage): The audio chunk from the request.
+        target_sr (int): The target sample rate.
+
+    Returns:
+        BytesIO: The resampled audio data in a BytesIO object.
+    """
+    if not audio_chunk:
+        return None
+
+    try:
+        # Read the audio data and its original sample rate
+        audio_data, original_sr = sf.read(audio_chunk)
+
+        # If the audio is already at the target sample rate, no need to resample
+        if original_sr == target_sr:
+            audio_chunk.seek(0)
+            return BytesIO(audio_chunk.read())
+
+        print(f"[RESAMPLE] Resampling audio from {original_sr} Hz to {target_sr} Hz")
+
+        # Convert to tensor for torchaudio
+        audio_tensor = torch.from_numpy(audio_data).float()
+        if audio_tensor.dim() == 1:
+            audio_tensor = audio_tensor.unsqueeze(0) # Add channel dimension if mono
+
+        # Create the resampler
+        resampler = torchaudio.transforms.Resample(orig_freq=original_sr, new_freq=target_sr)
+        resampled_tensor = resampler(audio_tensor)
+
+        # Convert back to numpy array
+        resampled_data = resampled_tensor.squeeze(0).numpy()
+
+        # Save the resampled audio to a BytesIO object
+        resampled_buffer = BytesIO()
+        sf.write(resampled_buffer, resampled_data, target_sr, format='WAV', subtype='PCM_16')
+        resampled_buffer.seek(0)
+
+        return resampled_buffer
+
+    except Exception as e:
+        print(f"[RESAMPLE ERROR] Failed to resample audio: {e}")
+        # Fallback: return the original audio chunk if resampling fails
+        audio_chunk.seek(0)
+        return BytesIO(audio_chunk.read())
 
 def merge_transcription_segments(previous_segments, new_segments, overlap_start_time):
     """
@@ -910,7 +963,7 @@ def get_response(text):
     """Get emotion analysis from external API"""
     print(f"[API REQUEST] Calling emotion model API")
     
-    url = "https://d612bc677495.ngrok-free.app/emotion"
+    url = "https://f9a470925488.ngrok-free.app/emotion"
     payload = {"text": text}
     try:
         response = requests.post(url, json=payload, timeout=2.5)
@@ -925,34 +978,79 @@ def get_response(text):
         print("Sentiment server not responding:", str(e))
     return None
 
-def calculate_cqs(predictions):
-    """Calculate Customer Quality Score based on emotions"""
-    emotion_weights = {
-        "joy": 2.5, "gratitude": 2.0, "admiration": 1.75, "optimism": 1.5, "relief": 1.25, "caring": 1.0,
-        "neutral": 0, "curiosity": 0, "realization": 0,
-        "anger": -2.5, "disapproval": -2.25, "disappointment": -2.0, "annoyance": -1.75, "sadness": -1.5, "embarrassment": -1.0, "confusion": -0.5
-    }
-    cqs = 0
-    emotions = predictions
-    emotions = dict(emotions[0])
+# def calculate_cqs(predictions):
+#     """Calculate Customer Quality Score based on emotions"""
+#     emotion_weights = {
+#         "joy": 2.5, "gratitude": 2.0, "admiration": 1.75, "optimism": 1.5, "relief": 1.25, "caring": 1.0,
+#         "neutral": 0, "curiosity": 0, "realization": 0,
+#         "anger": -2.5, "disapproval": -2.25, "disappointment": -2.0, "annoyance": -1.75, "sadness": -1.5, "embarrassment": -1.0, "confusion": -0.5
+#     }
+#     cqs = 0
+#     emotions = predictions
+#     emotions = dict(emotions[0])
 
-    print(emotions,"------------------------")
-    confidence = emotions['score']
-    emotion_recieved = emotions['label'].lower()
-    if emotion_recieved in emotion_weights:
-        default_cqs = emotion_weights[emotion_recieved] * confidence
-    else:
-        default_cqs = 0.1    # for emotion in predictions:
-    #     label = emotion["label"].lower()
-    #     # score = emotion["score"]
-    #     if label in emotion_weights:
-    #         # emotions[label] = round(score, 2)
-    #         weighted_contribution = emotion_weights[label] * score
-    #         cqs += weighted_contribution
-    cqs = default_cqs
-    final_cqs = abs(round(cqs, 2))
-    result = [final_cqs, emotions]
-    return result
+#     print(emotions,"------------------------")
+#     confidence = emotions['score']
+#     emotion_recieved = emotions['label'].lower()
+#     if emotion_recieved in emotion_weights:
+#         default_cqs = emotion_weights[emotion_recieved] * confidence
+#     else:
+#         default_cqs = 0.1    # for emotion in predictions:
+#     #     label = emotion["label"].lower()
+#     #     # score = emotion["score"]
+#     #     if label in emotion_weights:
+#     #         # emotions[label] = round(score, 2)
+#     #         weighted_contribution = emotion_weights[label] * score
+#     #         cqs += weighted_contribution
+#     cqs = default_cqs
+#     final_cqs = abs(round(cqs, 2))
+#     result = [final_cqs, emotions]
+#     return result
+
+emotions_CACHE = []
+def calculate_cqs(predictions, script_completion=0.0):
+    """Calculate Call Quality Score (CQS) using emotions + script adherence"""
+    print('Calculating call quality...')
+    # Emotion weight mapping — positive emotions get higher influence
+    emotion_weights = {
+        "admiration": 0.7, "amusement": 0.8, "anger": -0.9, "annoyance": -0.7,
+        "approval": 0.6, "caring": 0.6, "confusion": -0.5, "curiosity": 0.5,
+        "desire": 0.4, "disappointment": -0.8, "disapproval": -0.6, "disgust": -0.9,
+        "embarrassment": -0.5, "excitement": 1.0, "fear": -0.7, "gratitude": 1.2,
+        "grief": -1.0, "joy": 1.0, "love": 1.2, "nervousness": -0.5, "optimism": 0.8,
+        "pride": 0.5, "realization": 0.3, "relief": 0.5, "remorse": -0.4,
+        "sadness": -0.6, "surprise": 0.2, "neutral": 0.0,
+    }
+    total_weighted_score = 0.0
+    total_confidence = 0.0
+    if not predictions:
+        print("No predictions found.")
+        return [0.0, None]
+    current_emotion = dict(predictions[0])
+    print("Processing emotion_CACHEs...")
+    for emotion_group in emotions_CACHE:
+        if not emotion_group or not isinstance(emotion_group, list):
+            continue
+        top_emotion = emotion_group[0]
+        label = top_emotion['label'].lower()
+        score = top_emotion['score']
+        weight = emotion_weights.get(label, 0.0)
+        total_weighted_score += weight * score
+        total_confidence += score
+    if total_confidence == 0:
+        total_confidence = 1  # prevent division by zero
+    # Calculate emotion score scaled to 0–100
+    emotion_cqs = round((total_weighted_score / total_confidence) * 100, 2)
+    # Normalize script_completion
+    script_score = round(script_completion * 100, 2) if script_completion <= 1 else round(script_completion, 2)
+    # Final CQS: Weighted sum (Emotion: 60%, Script: 40%)
+    final_cqs = round((emotion_cqs * 0.6) + (script_score * 0.4), 2)
+    print(f"Emotion CQS: {emotion_cqs} | Script Score: {script_score} | Final CQS: {final_cqs}")
+    return [final_cqs, current_emotion]
+
+
+
+
 
 def agent_scores(transcription):
     """Evaluate agent performance using Groq AI"""
@@ -1158,6 +1256,10 @@ def update_call():
     
     client_audio_chunk = request.files.get('client_audio')
     agent_audio_chunk = request.files.get('agent_audio')
+
+    # Resample audio to 16k Hz
+    resampled_client_audio = resample_audio(client_audio_chunk)
+    resampled_agent_audio = resample_audio(agent_audio_chunk)
     call_id = request.form.get('call_id')
     transcript = request.form.get('transcript')
     
@@ -1173,7 +1275,7 @@ def update_call():
         
         # STEP 1: Store audio chunks and get processing data using the new optimized approach
         print("[UPDATE_CALL] Step 1: Storing chunks and getting processing audio...")
-        processing_data = call_ops.store_audio_chunk_and_process(call_id, client_audio_chunk, agent_audio_chunk)
+        processing_data = call_ops.store_audio_chunk_and_process(call_id, resampled_client_audio, resampled_agent_audio)
         
         # Extract processing results
         previous_agent_segments = processing_data.get("agent_segments", [])
@@ -1332,7 +1434,8 @@ def update_call():
         }
 
         response = get_response(total_client_text)
-        CQS, emotions = calculate_cqs(response)
+        emotions_CACHE.append(response)
+        CQS, emotions = calculate_cqs(response,adherence_data.get('script_completion', 0.0))
         quality = get_quality(emotions)
 
         # STEP 5: Update database with all the processed data
@@ -1553,7 +1656,7 @@ def final_update():
         # Get final emotion analysis for complete client transcript
         print(f"[FINAL_UPDATE] Analyzing final emotions for complete client transcript ({len(final_client_text)} chars)")
         final_emotion_response = get_response(final_client_text)
-        final_CQS, final_emotions = calculate_cqs(final_emotion_response)
+        final_CQS, final_emotions = calculate_cqs(final_emotion_response, final_adherence_data.get('script_completion', 0.0))
         final_quality = get_quality(final_emotions)
         
         print(f"[FINAL_UPDATE] Final emotion analysis complete:")
@@ -1563,7 +1666,7 @@ def final_update():
         
         # Keep the last chunk emotions for compatibility
         response = get_response(final_client_text)
-        CQS, emotions = calculate_cqs(response)
+        CQS, emotions = calculate_cqs(response, final_adherence_data.get('script_completion', 0.0))
         quality = get_quality(emotions)
         
         agent_quality = agent_scores(final_agent_text)
