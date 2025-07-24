@@ -15,6 +15,8 @@ import threading
 from bson.objectid import ObjectId
 import io
 import struct
+import os
+import tempfile
 
 class CallOperations:
     """Database operations for call management with optimized schema"""
@@ -24,6 +26,8 @@ class CallOperations:
         self.calls_collection = db.calls_collection
         self.fs = db.fs
         self.lock = threading.Lock()
+        self.audio_cache_dir = os.path.abspath('./audio_cache')
+        os.makedirs(self.audio_cache_dir, exist_ok=True)
 
     # =============================================================================
     # AUDIO PROCESSING HELPERS
@@ -147,36 +151,39 @@ class CallOperations:
             print(f"[AUDIO_DEBUG] Error converting PCM to WAV BytesIO: {e}")
             return None
     
+    def _get_previous_audio_from_local_cache(self, call_id, speaker_type):
+        """Get previous audio data from local cache for a specific speaker, extracting PCM data"""
+        try:
+            pcm_data = self._read_audio_cache(call_id, speaker_type)
+            if not pcm_data:
+                return None
+            # Assume default format for local cache
+            return pcm_data
+        except Exception as e:
+            print(f"[AUDIO_DEBUG] Error getting previous audio from local cache: {e}")
+            return None
+    
     def _get_previous_audio_from_gridfs(self, call_id, speaker_type):
         """Get previous audio data from GridFS for a specific speaker, extracting PCM data"""
         try:
             call = self.calls_collection.find_one({"call_id": call_id})
             if not call:
                 return None
-            
             audio_metadata = call.get('audio_metadata', {})
             file_id = None
-            
             if speaker_type == 'agent':
                 file_id = audio_metadata.get('agent_file_id')
             elif speaker_type == 'client':
                 file_id = audio_metadata.get('client_file_id')
-            
             if file_id:
                 audio_file = self.fs.get(ObjectId(file_id))
                 wav_data = audio_file.read()
-                
-                # Extract PCM data from WAV file for consistent processing
                 pcm_data, sample_rate, channels, sample_width = self._extract_pcm_from_wav(wav_data)
-                
-                print(f"[AUDIO_DEBUG] Retrieved {speaker_type} audio: WAV {len(wav_data)} bytes -> PCM {len(pcm_data) if pcm_data else 0} bytes ({sample_rate}Hz, {channels}ch, {sample_width}bytes)")
-                
+                print(f"[AUDIO_DEBUG] Retrieved {speaker_type} audio from GridFS: WAV {len(wav_data)} bytes -> PCM {len(pcm_data) if pcm_data else 0} bytes ({sample_rate}Hz, {channels}ch, {sample_width}bytes)")
                 return pcm_data
-            
             return None
-            
         except Exception as e:
-            print(f"[AUDIO_DEBUG] Error getting previous audio: {e}")
+            print(f"[AUDIO_DEBUG] Error getting previous audio from GridFS: {e}")
             return None
     
     def _combine_and_slice_audio(self, previous_audio_bytes, new_audio_bytes, overlap_start_seconds):
@@ -402,69 +409,36 @@ class CallOperations:
         return call
 
     def store_audio_and_update_call(self, call_id, client_audio, agent_audio, is_final):
-        """Store audio files in GridFS and return file IDs - NOTE: Called within lock context"""
+        """Store audio files in local cache for intermediate updates, and in GridFS only at final update."""
         try:
             print(f"[DB_DEBUG] Starting store_audio_and_update_call for call_id: {call_id}")
-            # NOTE: No lock here as this is called from within store_audio_chunk_and_process which already has the lock
-            
-            # Get existing audio metadata to check for previous files
             call_doc = self.calls_collection.find_one({"call_id": call_id})
             audio_metadata = call_doc.get('audio_metadata', {}) if call_doc else {}
             
-            # Store client audio with proper format handling
+            # Store client audio
             client_file_id = None
             if client_audio:
                 print(f"[DB_DEBUG] Processing client audio...")
                 client_audio.seek(0)
                 new_client_audio_bytes = client_audio.read()
-                
-                # Extract PCM data from new audio (handles both WAV and raw PCM)
                 new_client_pcm, sample_rate, channels, sample_width = self._extract_pcm_from_wav(new_client_audio_bytes)
                 print(f"[DB_DEBUG] New client audio - PCM: {len(new_client_pcm) if new_client_pcm else 0} bytes, SR: {sample_rate}, CH: {channels}, SW: {sample_width}")
-                
-                # Get previous client audio if exists
-                previous_client_file_id = audio_metadata.get('client_file_id')
-                previous_client_pcm = None
-                
-                if previous_client_file_id:
-                    try:
-                        previous_client_file = self.fs.get(ObjectId(previous_client_file_id))
-                        previous_client_audio_bytes = previous_client_file.read()
-                        # Extract PCM from previous audio
-                        previous_client_pcm, prev_sr, prev_ch, prev_sw = self._extract_pcm_from_wav(previous_client_audio_bytes)
-                        # Delete the old file
-                        self.fs.delete(ObjectId(previous_client_file_id))
-                        print(f"[DB_DEBUG] Previous client audio - PCM: {len(previous_client_pcm) if previous_client_pcm else 0} bytes, SR: {prev_sr}, CH: {prev_ch}, SW: {prev_sw}")
-                        
-                        # Ensure format consistency
-                        if prev_sr != sample_rate or prev_ch != channels or prev_sw != sample_width:
-                            print(f"[DB_DEBUG] WARNING: Audio format mismatch! Using new format: {sample_rate}Hz, {channels}ch, {sample_width}bytes")
-                        
-                    except Exception as e:
-                        print(f"[DB_DEBUG] Could not retrieve previous client audio: {e}")
-                
-                # Combine PCM data properly
-                if previous_client_pcm and new_client_pcm:
-                    combined_client_pcm = self._combine_pcm_data([previous_client_pcm, new_client_pcm], sample_rate, channels, sample_width)
-                    print(f"[DB_DEBUG] Combined client PCM: {len(previous_client_pcm)} + {len(new_client_pcm)} = {len(combined_client_pcm)} bytes")
-                elif new_client_pcm:
-                    combined_client_pcm = new_client_pcm
-                    print(f"[DB_DEBUG] New client PCM: {len(combined_client_pcm)} bytes")
+                if not is_final:
+                    self._append_to_audio_cache(call_id, 'client', new_client_pcm)
+                    combined_client_pcm = self._read_audio_cache(call_id, 'client')
+                    print(f"[DB_DEBUG] Local cache client PCM: {len(combined_client_pcm)} bytes")
                 else:
-                    combined_client_pcm = None
-                
-                # Convert back to WAV format for storage
-                if combined_client_pcm:
+                    # On final update, combine all and store in GridFS
+                    self._append_to_audio_cache(call_id, 'client', new_client_pcm)
+                    combined_client_pcm = self._read_audio_cache(call_id, 'client')
                     combined_client_wav = self._create_wav_file(combined_client_pcm, sample_rate, channels, sample_width)
-                    
-                    # Store combined audio as WAV
                     client_file_id = self.fs.put(
                         io.BytesIO(combined_client_wav),
                         filename=f"{call_id}_client_combined.wav",
                         metadata={
                             "call_id": call_id, 
                             "type": "client", 
-                            "is_final": is_final, 
+                            "is_final": True,
                             "combined": True,
                             "sample_rate": sample_rate,
                             "channels": channels,
@@ -473,62 +447,32 @@ class CallOperations:
                             "wav_size": len(combined_client_wav)
                         }
                     )
-                    print(f"[DB_DEBUG] Combined client WAV stored with ID: {client_file_id} (PCM: {len(combined_client_pcm)}, WAV: {len(combined_client_wav)} bytes)")
+                    print(f"[DB_DEBUG] Final client WAV stored with ID: {client_file_id} (PCM: {len(combined_client_pcm)}, WAV: {len(combined_client_wav)} bytes)")
+                    self._delete_audio_cache(call_id)
             
-            # Store agent audio with proper format handling (similar process)
+            # Store agent audio
             agent_file_id = None
             if agent_audio:
                 print(f"[DB_DEBUG] Processing agent audio...")
                 agent_audio.seek(0)
                 new_agent_audio_bytes = agent_audio.read()
-                
-                # Extract PCM data from new audio (handles both WAV and raw PCM)
                 new_agent_pcm, sample_rate, channels, sample_width = self._extract_pcm_from_wav(new_agent_audio_bytes)
                 print(f"[DB_DEBUG] New agent audio - PCM: {len(new_agent_pcm) if new_agent_pcm else 0} bytes, SR: {sample_rate}, CH: {channels}, SW: {sample_width}")
-                
-                # Get previous agent audio if exists
-                previous_agent_file_id = audio_metadata.get('agent_file_id')
-                previous_agent_pcm = None
-                
-                if previous_agent_file_id:
-                    try:
-                        previous_agent_file = self.fs.get(ObjectId(previous_agent_file_id))
-                        previous_agent_audio_bytes = previous_agent_file.read()
-                        # Extract PCM from previous audio
-                        previous_agent_pcm, prev_sr, prev_ch, prev_sw = self._extract_pcm_from_wav(previous_agent_audio_bytes)
-                        # Delete the old file
-                        self.fs.delete(ObjectId(previous_agent_file_id))
-                        print(f"[DB_DEBUG] Previous agent audio - PCM: {len(previous_agent_pcm) if previous_agent_pcm else 0} bytes, SR: {prev_sr}, CH: {prev_ch}, SW: {prev_sw}")
-                        
-                        # Ensure format consistency
-                        if prev_sr != sample_rate or prev_ch != channels or prev_sw != sample_width:
-                            print(f"[DB_DEBUG] WARNING: Audio format mismatch! Using new format: {sample_rate}Hz, {channels}ch, {sample_width}bytes")
-                        
-                    except Exception as e:
-                        print(f"[DB_DEBUG] Could not retrieve previous agent audio: {e}")
-                
-                # Combine PCM data properly
-                if previous_agent_pcm and new_agent_pcm:
-                    combined_agent_pcm = self._combine_pcm_data([previous_agent_pcm, new_agent_pcm], sample_rate, channels, sample_width)
-                    print(f"[DB_DEBUG] Combined agent PCM: {len(previous_agent_pcm)} + {len(new_agent_pcm)} = {len(combined_agent_pcm)} bytes")
-                elif new_agent_pcm:
-                    combined_agent_pcm = new_agent_pcm
-                    print(f"[DB_DEBUG] New agent PCM: {len(combined_agent_pcm)} bytes")
+                if not is_final:
+                    self._append_to_audio_cache(call_id, 'agent', new_agent_pcm)
+                    combined_agent_pcm = self._read_audio_cache(call_id, 'agent')
+                    print(f"[DB_DEBUG] Local cache agent PCM: {len(combined_agent_pcm)} bytes")
                 else:
-                    combined_agent_pcm = None
-                
-                # Convert back to WAV format for storage
-                if combined_agent_pcm:
+                    self._append_to_audio_cache(call_id, 'agent', new_agent_pcm)
+                    combined_agent_pcm = self._read_audio_cache(call_id, 'agent')
                     combined_agent_wav = self._create_wav_file(combined_agent_pcm, sample_rate, channels, sample_width)
-                    
-                    # Store combined audio as WAV
                     agent_file_id = self.fs.put(
                         io.BytesIO(combined_agent_wav),
                         filename=f"{call_id}_agent_combined.wav",
                         metadata={
                             "call_id": call_id, 
                             "type": "agent", 
-                            "is_final": is_final, 
+                            "is_final": True,
                             "combined": True,
                             "sample_rate": sample_rate,
                             "channels": channels,
@@ -537,24 +481,25 @@ class CallOperations:
                             "wav_size": len(combined_agent_wav)
                         }
                     )
-                    print(f"[DB_DEBUG] Combined agent WAV stored with ID: {agent_file_id} (PCM: {len(combined_agent_pcm)}, WAV: {len(combined_agent_wav)} bytes)")
+                    print(f"[DB_DEBUG] Final agent WAV stored with ID: {agent_file_id} (PCM: {len(combined_agent_pcm)}, WAV: {len(combined_agent_wav)} bytes)")
+                    self._delete_audio_cache(call_id)
             
-            # Update call with audio file IDs
+            # Update call with audio file IDs only at final update
             update_doc = {"$set": {}}
-            if client_file_id:
-                update_doc["$set"]["audio_metadata.client_file_id"] = client_file_id
-            if agent_file_id:
-                update_doc["$set"]["audio_metadata.agent_file_id"] = agent_file_id
+            if is_final:
+                if client_file_id:
+                    update_doc["$set"]["audio_metadata.client_file_id"] = client_file_id
+                if agent_file_id:
+                    update_doc["$set"]["audio_metadata.agent_file_id"] = agent_file_id
+                print(f"[DB_DEBUG] Updating call document with audio metadata...")
+                if update_doc["$set"]:
+                    self.calls_collection.update_one({"call_id": call_id}, update_doc)
+                    print(f"[DB_DEBUG] Call document updated successfully")
+                    self._delete_audio_cache(call_id)
             
-            print(f"[DB_DEBUG] Updating call document with audio metadata...")
-            if update_doc["$set"]:
-                self.calls_collection.update_one({"call_id": call_id}, update_doc)
-                print(f"[DB_DEBUG] Call document updated successfully")
-            
-            result = {"stored_audio": {"client_id": str(client_file_id), "agent_id": str(agent_file_id)}}
+            result = {"stored_audio": {"client_id": str(client_file_id) if client_file_id else None, "agent_id": str(agent_file_id) if agent_file_id else None}}
             print(f"[DB_DEBUG] store_audio_and_update_call completed successfully")
             return result
-                
         except Exception as e:
             print(f"[DB_DEBUG] ERROR in store_audio_and_update_call: {e}")
             import traceback
@@ -723,29 +668,26 @@ class CallOperations:
     def store_audio_chunk_and_process(self, call_id, client_audio, agent_audio):
         """
         Store audio chunk and process segments using the new optimized flow:
-        1. Store new chunks in DB (combined with previous)
-        2. Get complete audio from last segment start to current chunk end
+        1. Store new chunks in local cache (combined with previous)
+        2. Get complete audio from last segment start to current chunk end from local cache
         3. Return this audio segment for processing (adherence, emotions, etc.)
+        At final update, save the complete audio to MongoDB and clean up local cache.
         """
         try:
             print(f"[CHUNK_PROCESS] Starting store_audio_chunk_and_process for call_id: {call_id}")
-            
             with self.lock:
                 # STEP 1: Store new audio chunks (combine with existing)
                 print(f"[CHUNK_PROCESS] Step 1: Storing audio chunks...")
-                stored_audio = self.store_audio_and_update_call(call_id, client_audio, agent_audio, False)
+                # Always store in local cache, never in GridFS here
+                stored_audio = self.store_audio_and_update_call(call_id, client_audio, agent_audio, is_final=False)
                 print(f"[CHUNK_PROCESS] Audio stored: {stored_audio}")
-                
                 # STEP 2: Get current conversation segments to determine last segment times
                 print(f"[CHUNK_PROCESS] Step 2: Getting current conversation segments...")
                 conversation = self.get_conversation(call_id)
-                
-                # Convert segments back to expected format and find last segment times
                 agent_segments = []
                 client_segments = []
                 last_agent_segment_start = 0.0
                 last_client_segment_start = 0.0
-                
                 for entry in conversation:
                     converted_entry = {
                         'text': entry.get('text', ''),
@@ -753,45 +695,33 @@ class CallOperations:
                         'end': entry.get('end_time', 0),
                         'confidence': entry.get('confidence', 1.0)
                     }
-                    
                     if entry.get('speaker') == 'agent':
                         agent_segments.append(converted_entry)
                         last_agent_segment_start = max(last_agent_segment_start, entry.get('start_time', 0))
                     elif entry.get('speaker') == 'client':
                         client_segments.append(converted_entry)
                         last_client_segment_start = max(last_client_segment_start, entry.get('start_time', 0))
-                
                 print(f"[CHUNK_PROCESS] Found {len(agent_segments)} agent segments, {len(client_segments)} client segments")
                 print(f"[CHUNK_PROCESS] Last agent segment start: {last_agent_segment_start}s")
                 print(f"[CHUNK_PROCESS] Last client segment start: {last_client_segment_start}s")
-                
-                # STEP 3: Get complete combined audio from storage
-                print(f"[CHUNK_PROCESS] Step 3: Getting complete combined audio...")
-                complete_client_audio = self._get_previous_audio_from_gridfs(call_id, 'client')
-                complete_agent_audio = self._get_previous_audio_from_gridfs(call_id, 'agent')
-                
+                # STEP 3: Get complete combined audio from local cache
+                print(f"[CHUNK_PROCESS] Step 3: Getting complete combined audio from local cache...")
+                complete_client_audio = self._get_previous_audio_from_local_cache(call_id, 'client')
+                complete_agent_audio = self._get_previous_audio_from_local_cache(call_id, 'agent')
                 print(f"[CHUNK_PROCESS] Complete agent audio: {len(complete_agent_audio) if complete_agent_audio else 0} bytes")
                 print(f"[CHUNK_PROCESS] Complete client audio: {len(complete_client_audio) if complete_client_audio else 0} bytes")
-                
                 # STEP 4: Extract audio from last segment start to end of current chunk
                 print(f"[CHUNK_PROCESS] Step 4: Extracting audio from last segment start to chunk end...")
-                
-                # For processing, we want audio from the last segment start to the end
-                # This gives us the context needed for accurate analysis
                 processing_agent_audio_pcm = self._slice_audio_from_time(complete_agent_audio, last_agent_segment_start)
                 processing_client_audio_pcm = self._slice_audio_from_time(complete_client_audio, last_client_segment_start)
-                
                 print(f"[CHUNK_PROCESS] Agent PCM audio (from {last_agent_segment_start}s): {len(processing_agent_audio_pcm) if processing_agent_audio_pcm else 0} bytes")
                 print(f"[CHUNK_PROCESS] Client PCM audio (from {last_client_segment_start}s): {len(processing_client_audio_pcm) if processing_client_audio_pcm else 0} bytes")
-                
                 # STEP 5: Convert PCM data to proper WAV format for API compatibility
                 print(f"[CHUNK_PROCESS] Step 5: Converting PCM to WAV format...")
                 processing_agent_audio = self._pcm_data_to_wav_bytesio(processing_agent_audio_pcm)
                 processing_client_audio = self._pcm_data_to_wav_bytesio(processing_client_audio_pcm)
-                
                 print(f"[CHUNK_PROCESS] Agent WAV audio for processing: {processing_agent_audio.getvalue().__len__() if processing_agent_audio else 0} bytes")
                 print(f"[CHUNK_PROCESS] Client WAV audio for processing: {processing_client_audio.getvalue().__len__() if processing_client_audio else 0} bytes")
-                
                 # STEP 6: Prepare result with all necessary data
                 result = {
                     "stored_audio": stored_audio.get("stored_audio", {}),
@@ -801,7 +731,6 @@ class CallOperations:
                     "client_overlap_start": last_client_segment_start,
                     "agent_audio_for_transcription": processing_agent_audio,
                     "client_audio_for_transcription": processing_client_audio,
-                    # Additional context for processing
                     "processing_context": {
                         "last_agent_segment_start": last_agent_segment_start,
                         "last_client_segment_start": last_client_segment_start,
@@ -813,10 +742,8 @@ class CallOperations:
                         }
                     }
                 }
-                
                 print(f"[CHUNK_PROCESS] store_audio_chunk_and_process completed successfully")
                 return result
-                
         except Exception as e:
             print(f"[CHUNK_PROCESS] ERROR in store_audio_chunk_and_process: {e}")
             import traceback
@@ -886,50 +813,50 @@ class CallOperations:
             call = self.get_call(call_id)
             if not call:
                 return {}
-            
-            # Get audio file IDs
+            # For final update, fetch from GridFS; otherwise, fetch from local cache
             audio_metadata = call.get('audio_metadata', {})
             client_file_id = audio_metadata.get('client_file_id')
             agent_file_id = audio_metadata.get('agent_file_id')
-            
             # Retrieve audio data
             client_audio = None
             agent_audio = None
-            
-            if client_file_id:
-                client_file = self.fs.get(ObjectId(client_file_id))
-                client_audio = client_file.read()
-            
-            if agent_file_id:
-                agent_file = self.fs.get(ObjectId(agent_file_id))
-                agent_audio = agent_file.read()
-            
+            if client_file_id and agent_file_id:
+                # If both exist, assume final update, fetch from GridFS
+                client_audio = None
+                agent_audio = None
+                try:
+                    client_audio = self.fs.get(ObjectId(client_file_id)).read()
+                except Exception:
+                    pass
+                try:
+                    agent_audio = self.fs.get(ObjectId(agent_file_id)).read()
+                except Exception:
+                    pass
+            else:
+                # Otherwise, fetch from local cache
+                client_audio = self._read_audio_cache(call_id, 'client')
+                agent_audio = self._read_audio_cache(call_id, 'agent')
             # Get segments from conversation and convert to expected format
             conversation = call.get('conversation', [])
-            
             agent_segments = []
             client_segments = []
-            
             for entry in conversation:
                 converted_entry = {
                     'text': entry.get('text', ''),
-                    'start': entry.get('start_time', 0),  # Convert start_time to start
-                    'end': entry.get('end_time', 0),      # Convert end_time to end
+                    'start': entry.get('start_time', 0),
+                    'end': entry.get('end_time', 0),
                     'confidence': entry.get('confidence', 1.0)
                 }
-                
                 if entry.get('speaker') == 'agent':
                     agent_segments.append(converted_entry)
                 elif entry.get('speaker') == 'client':
                     client_segments.append(converted_entry)
-            
             return {
                 "client_audio": client_audio,
                 "agent_audio": agent_audio,
                 "agent_segments": agent_segments,
                 "client_segments": client_segments
             }
-            
         except Exception as e:
             return {}
 
@@ -956,6 +883,29 @@ class CallOperations:
             
         except Exception as e:
             pass
+
+    def _get_audio_cache_path(self, call_id, speaker_type):
+        return os.path.join(self.audio_cache_dir, f'{call_id}_{speaker_type}.pcm')
+
+    def _append_to_audio_cache(self, call_id, speaker_type, pcm_data):
+        if not pcm_data:
+            return
+        path = self._get_audio_cache_path(call_id, speaker_type)
+        with open(path, 'ab') as f:
+            f.write(pcm_data)
+
+    def _read_audio_cache(self, call_id, speaker_type):
+        path = self._get_audio_cache_path(call_id, speaker_type)
+        if not os.path.exists(path):
+            return b''
+        with open(path, 'rb') as f:
+            return f.read()
+
+    def _delete_audio_cache(self, call_id):
+        for speaker_type in ['agent', 'client']:
+            path = self._get_audio_cache_path(call_id, speaker_type)
+            if os.path.exists(path):
+                os.remove(path)
 
 
 # Singleton instance to be used by the app

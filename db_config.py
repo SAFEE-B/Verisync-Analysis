@@ -6,7 +6,8 @@ import json
 from typing import Optional, Dict, Any, List
 from bson import ObjectId
 import threading
-
+from dotenv import load_dotenv
+load_dotenv()
 class MongoDB:
     """MongoDB connection and operations manager with GridFS support for audio storage"""
     
@@ -24,13 +25,18 @@ class MongoDB:
             # Get MongoDB connection details from environment
             mongo_uri = os.getenv('MONGODB_URI')
             db_name = os.getenv('MONGODB_DB_NAME', 'verisync')
-            
+            print(f"[DB DEBUG] MONGODB_URI: {mongo_uri}")
+            print(f"[DB DEBUG] MONGODB_HOST: {os.getenv('MONGODB_HOST')}")
+            print(f"[DB DEBUG] MONGODB_PORT: {os.getenv('MONGODB_PORT')}")
+            print(f"[DB DEBUG] MONGODB_USER: {os.getenv('MONGODB_USER')}")
+            print(f"[DB DEBUG] MONGODB_PASS: {os.getenv('MONGODB_PASS')}")
+            print(f"[DB DEBUG] MONGODB_DB_NAME: {db_name}")
             if mongo_uri:
                 # Use MongoDB URI (for cloud databases like MongoDB Atlas)
                 self.client = MongoClient(mongo_uri)
             else:
                 # Use individual connection parameters
-                host = os.getenv('MONGODB_HOST', 'localhost')
+                host = os.getenv('MONGODB_HOST', '10.255.255.254')
                 port = int(os.getenv('MONGODB_PORT', 27017))
                 username = os.getenv('MONGODB_USER')
                 password = os.getenv('MONGODB_PASS')

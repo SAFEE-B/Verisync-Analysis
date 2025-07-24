@@ -155,7 +155,7 @@ class AudioChunkTester:
             request_time = time.time() - start_time
             
             # Process response
-            if response.status_code == 200:
+            if response.status_code == 202:
                 result = response.json()
                 print(f"[SUCCESS] Chunk {chunk_index + 1} processed in {request_time:.2f}s")
                 
